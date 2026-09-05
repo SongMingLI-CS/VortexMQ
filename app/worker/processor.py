@@ -37,6 +37,8 @@ from app.models.task import TaskRecord
 from app.services.workflow import awaken_downstream, cancel_descendants
 # 导入内置 demo.* Handler（副作用：模块 import 期完成注册）
 from app.worker import handlers as _demo_handlers  # noqa: F401
+# 导入 AI Handler（副作用：模块 import 期完成注册 ai.deepseek.chat）
+from app.handlers import ai_handlers as _ai_handlers  # noqa: F401
 from app.worker.registry import UnregisteredTaskError, vortex_registry
 
 logger = logging.getLogger("vortexmq.worker")

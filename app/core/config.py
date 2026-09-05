@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # 避免误部署把跨租户管理接口暴露成匿名可调。必须用随机长串覆盖默认值。
     ADMIN_API_KEY: str = ""
 
+    # DeepSeek LLM API 凭证。为空时 ai.deepseek.chat 走 Mock 路径（sleep 1s 后返回
+    # 模拟文本），保证 Showcase / 测试无需外部依赖也能跑通完整 DAG。
+    DEEPSEEK_API_KEY: str = ""
+
     # 例：postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq"
 

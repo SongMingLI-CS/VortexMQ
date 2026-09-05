@@ -23,5 +23,8 @@ prometheus-client>=0.21.0
 # 压测客户端
 aiohttp>=3.11.0
 
+# HTTP 客户端（AI Handler 调用 DeepSeek、Python SDK 底层通信）
+httpx>=0.28.0
+
 # 读取 .env
 python-dotenv>=1.0.1
