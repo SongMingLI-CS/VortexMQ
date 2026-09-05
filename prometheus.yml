@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Docker Compose 服务名即 Hostname：api / worker
+  # 不要使用 localhost——那会指向 Prometheus 容器自己
+  - job_name: vortexmq-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: vortexmq-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:8001"]

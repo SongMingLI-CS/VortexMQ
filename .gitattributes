@@ -1,0 +1,8 @@
+# 统一以 LF 入库，Windows 检出时按需换行
+* text=auto
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ini text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

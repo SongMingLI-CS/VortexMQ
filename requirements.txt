@@ -1,0 +1,27 @@
+# Web 框架与 ASGI 服务器
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# 数据校验与配置
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# 异步 ORM 与 PostgreSQL 驱动
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+
+# Redis Streams（redis.asyncio 位于 redis 包内）
+redis>=5.2.0
+
+# API Key 哈希（bcrypt 4.1+ 与 passlib 1.7.4 不兼容，钉在 4.0.x）
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0.1,<4.1.0
+
+# 可观测性
+prometheus-client>=0.21.0
+
+# 压测客户端
+aiohttp>=3.11.0
+
+# 读取 .env
+python-dotenv>=1.0.1

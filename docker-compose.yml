@@ -1,0 +1,124 @@
+# VortexMQ 本地编排：数据面 + API/Worker + 可观测性。
+# Prometheus 通过 Docker DNS 访问 api:8000/metrics，不要写 localhost。
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/vortexmq
+  REDIS_URL: redis://redis:6379/0
+  DEBUG: "false"
+  REDIS_STREAM_KEY: vortex:tasks:stream
+  REDIS_DELAYED_KEY: vortex:tasks:delayed
+  REDIS_CONSUMER_GROUP: vortex:workers
+  WORKER_METRICS_PORT: "8001"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vortexmq-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vortexmq
+    ports:
+      - "5432:5432"
+    volumes:
+      - vortexmq_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: vortexmq-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - vortexmq_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    container_name: vortexmq-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      <<: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+
+  worker:
+    build: .
+    container_name: vortexmq-worker
+    command: python -m app.worker
+    environment:
+      <<: *app-env
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: vortexmq-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - vortexmq_prom_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: vortexmq-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - vortexmq_grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  vortexmq_pg_data:
+  vortexmq_redis_data:
+  vortexmq_prom_data:
+  vortexmq_grafana_data:

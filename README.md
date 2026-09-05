@@ -1,0 +1,186 @@
+# VortexMQ
+
+**A High-Performance, Multi-Tenant Async Task Queue & Event Pipeline**
+
+多租户异步任务队列与事件管道。PostgreSQL 保存状态，Redis 只负责叫醒执行器。
+
+[English](README.md) · [中文](README.zh-CN.md) · [Technical Whitepaper (zh-CN)](WHITEPAPER.zh-CN.md) · [Freshman lecture notes (zh-CN)](KNOWLEDGE.zh-CN.md)
+
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-asyncio-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Redis Streams](https://img.shields.io/badge/Redis-Streams%20%2B%20ZSet-DC382D?logo=redis&logoColor=white)](https://redis.io/docs/latest/develop/data-types/streams/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-SSOT-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+
+---
+
+## Enterprise-Grade Features / 核心特性
+
+**Dual-Write Consistency via Outbox Pattern.** The API commits `PENDING` to PostgreSQL first, then `XADD` / `ZADD` to Redis. If the second write dies, an Outbox Sweeper re-enqueues from the row. Redis is allowed to forget; the database is not.
+
+**Distributed Concurrency Control & Consumer Groups.** Workers join `vortex:workers` and read with `XREADGROUP`. A message sits in exactly one consumer's PEL until `XACK`. Idle PEL entries are reclaimed with `XAUTOCLAIM`.
+
+**High-Precision Time Wheel via Redis ZSet.** `execute_at` in the future is scored into `vortex:tasks:delayed`. A Delay Dispatcher runs a Lua script every second: due members move to the Stream in one atomic hop.
+
+**Self-Healing & Exponential Backoff.** A failed execution increments `retry_count`, writes `next_execute_at = now + base * 2^retry_count`, `ZADD`s the delayed set, then `XACK`s. After three failures the row becomes `DLQ` with the traceback in `error_msg`.
+
+**Graceful Shutdown.** `SIGINT` / `SIGTERM` only set a stop flag. The process stops issuing `XREADGROUP`, finishes the in-flight `RUNNING` task (Postgres write + `XACK`), then closes pools.
+
+---
+
+## Architecture / 架构
+
+Control plane (API, Sweeper, Dispatcher) and data plane (Worker) share two stores and nothing else. They scale independently.
+
+```mermaid
+flowchart TB
+  subgraph clients [Callers]
+    C[HTTP clients / stress harness]
+  end
+
+  subgraph control [Control Plane]
+    API["FastAPI  POST /api/v1/tasks"]
+    OB[Outbox Sweeper]
+    DD[Delay Dispatcher]
+  end
+
+  subgraph truth [Source of Truth]
+    PG[(PostgreSQL<br/>task_records.status / execute_at)]
+  end
+
+  subgraph wake [Wake-up Fabric]
+    STREAM[[Redis Stream<br/>vortex:tasks:stream]]
+    ZSET[[Redis ZSet<br/>vortex:tasks:delayed]]
+  end
+
+  subgraph data [Data Plane]
+    W[Worker nodes<br/>XREADGROUP + PEL]
+  end
+
+  C -->|X-API-Key + payload| API
+  API -->|1. COMMIT PENDING| PG
+  API -->|2a. due now: XADD| STREAM
+  API -->|2b. not due: ZADD| ZSET
+
+  OB -->|SELECT FOR UPDATE SKIP LOCKED<br/>stale PENDING| PG
+  OB -->|replay XADD or ZADD| STREAM
+  OB --> ZSET
+
+  DD -->|"EVAL: ZRANGEBYSCORE → XADD → ZREM"| ZSET
+  DD --> STREAM
+
+  W -->|XREADGROUP BLOCK| STREAM
+  W -->|RUNNING / SUCCESS / PENDING+backoff / DLQ| PG
+  W -->|retry: ZADD then XACK| ZSET
+  W -->|XACK| STREAM
+```
+
+Status machine: `PENDING → RUNNING → SUCCESS`, or `RUNNING → PENDING` (retry) / `DLQ`. Redis never owns that machine. Stream fields are `task_id` (and optionally `tenant_id`); payload lives in JSONB on the row.
+
+---
+
+## Core Design Decisions / 硬核设计抉择
+
+### 1. PostgreSQL is the single source of truth. Redis only wakes workers.
+
+A Stream entry is a hint, not a contract. Persistence, tenant isolation, retry count, `execute_at`, and dead-letter text all have a WAL. Redis AOF helps, but a flush, a failover, or a bad `XACK` still cannot invent a task that was never committed, and cannot erase a row that was.
+
+The publish path is therefore **commit then notify**:
+
+1. Insert `PENDING` and `COMMIT`.
+2. `XADD` or `ZADD`. On failure the HTTP handler still returns `201` with `task_id`. The Outbox Sweeper is the repair path.
+
+Workers are at-least-once. `SUCCESS` / `FAILED` / `DLQ` are terminal: a duplicate Stream delivery is `XACK`ed without re-running side effects. A message whose `execute_at` is still in the future is put back on the ZSet and `XACK`ed. Postgres wins the clock.
+
+If you reverse the order (notify then commit), a worker can `XREADGROUP` a `task_id` that is not visible yet. That is a harder bug than a delayed retry.
+
+### 2. `SELECT … FOR UPDATE SKIP LOCKED` for the Outbox scan
+
+Several API replicas each run the Sweeper. A naive `SELECT … FOR UPDATE` serializes them: replica B waits on A's locks, then may `XADD` the same ids.
+
+`SKIP LOCKED` makes the scan a non-blocking claim. A holds a batch; B takes whatever is left. After a successful Redis write the sweeper bumps `updated_at`, so the same row is invisible for the stale window (default 30s). That bump is the lease. The lock is only held for the duration of the transaction that includes the Redis write.
+
+This is the same shape as a Postgres job table. It is not fancy. It is the correct isolation primitive when the Outbox lives in the same database as the tasks.
+
+### 3. Delay Dispatcher uses Lua because three commands are not atomic
+
+Due-task promotion is:
+
+```text
+ZRANGEBYSCORE delayed -inf <now> LIMIT 0 N
+XADD stream * task_id <id>     # per member
+ZREM delayed <id>
+```
+
+Two Dispatcher processes (or two API workers after a rolling deploy) can both observe the same members between `ZRANGEBYSCORE` and `ZREM`. You get two Stream messages for one delay. Consumer groups do not help: those are two distinct IDs.
+
+`EVAL` runs the loop on the Redis thread. No other command interleaves. One member is moved once.
+
+Caveat: Redis does not roll back a Lua script that errors mid-loop. Partial `XADD` without `ZREM` means at-least-once into the Stream; the Worker idempotency above covers it. Partial `ZREM` without `XADD` would drop the wake-up. The Sweeper still sees `PENDING` + `execute_at` and will `ZADD` or `XADD` again. That is why the row remains the source of truth even for the time wheel.
+
+On Redis Cluster, both keys in the script must hash to the same slot. Single-node Compose does not care.
+
+---
+
+## Quick Start
+
+```bash
+docker compose up -d --build
+# or: make up
+```
+
+| Port | Service |
+|------|---------|
+| 8000 | API (`/docs`, `/metrics`) |
+| 8001 | Worker metrics |
+| 5432 | PostgreSQL |
+| 6379 | Redis |
+| 9090 | Prometheus |
+| 3000 | Grafana (`admin` / `admin`) |
+
+API keys are no longer seeded on boot. Issue a tenant key (plaintext is printed once):
+
+```bash
+python -m app.cli create-tenant default
+```
+
+Immediate task (put the printed key into `X-API-Key`):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <your-api-key>" \
+  -d "{\"task_type\":\"email.send\",\"payload\":{\"to\":\"ops@example.com\"}}"
+```
+
+Delayed task (ZSet path):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <your-api-key>" \
+  -d "{\"task_type\":\"delay.wakeup\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
+```
+
+Load mix (70% immediate / 20% delayed / 10% poison pills):
+
+```bash
+make stress STRESS_ARGS="--api-key <your-api-key>"
+# make stress STRESS_ARGS="--api-key <key> --count 2000 --concurrency 100"
+```
+
+Worker logs: `make logs-worker`. Stop: `make down`.
+
+---
+
+## Layout
+
+```
+app/api/          HTTP, tenant auth via X-API-Key
+app/core/         config, async engine, Redis pool, Lua, Prometheus
+app/models/       Tenant, TaskRecord
+app/services/     submit, Outbox Sweeper, Delay Dispatcher
+app/worker/       consumer loop, backoff, graceful stop
+scripts/          asyncio + aiohttp stress client
+```
+
+API process: HTTP + Sweeper + Dispatcher. Worker process: `python -m app.worker`. Do not colocate them if you want the data plane to scale on its own.
