@@ -24,6 +24,8 @@ from app.core.database import engine, init_db
 from app.core.metrics import (
     beat_worker_heartbeat,
     clear_worker_heartbeat,
+    decrement_worker_in_flight,
+    increment_worker_in_flight,
     start_metrics_http_server,
 )
 from app.core.redis import (
@@ -93,6 +95,17 @@ def _parse_stream_messages(result: object) -> list[tuple[str, dict[str, str], st
         for message_id, fields in messages:
             entries.append((message_id, dict(fields), str(stream_name)))
     return entries
+
+
+async def _process_message(
+    message_id: str, fields: dict[str, str], stream_key: str
+) -> None:
+    """包一层 in-flight 计数：心跳负载 = 本进程正在执行的消息数。"""
+    increment_worker_in_flight()
+    try:
+        await handle_message(message_id, fields, stream_key=stream_key)
+    finally:
+        decrement_worker_in_flight()
 
 
 async def _claim_idle_pending(
@@ -218,7 +231,7 @@ async def run_worker() -> None:
                 break
             message_id, fields, stream_key = own_pending[0]
             try:
-                await handle_message(message_id, fields, stream_key=stream_key)
+                await _process_message(message_id, fields, stream_key)
                 drained += 1
             except Exception:
                 logger.exception("启动排空 PEL 失败，保留待重试: id=%s", message_id)
@@ -239,7 +252,7 @@ async def run_worker() -> None:
             new_messages, new_cursor = await _read_new_messages(consumer, tenants, new_cursor)
             for message_id, fields, stream_key in new_messages:
                 try:
-                    await handle_message(message_id, fields, stream_key=stream_key)
+                    await _process_message(message_id, fields, stream_key)
                 except Exception:
                     logger.exception("处理新消息失败，保留 PEL 待重试: id=%s", message_id)
 
@@ -255,7 +268,7 @@ async def run_worker() -> None:
                 break
             for message_id, fields, stream_key in pending:
                 try:
-                    await handle_message(message_id, fields, stream_key=stream_key)
+                    await _process_message(message_id, fields, stream_key)
                 except Exception:
                     logger.exception("处理认领消息失败，保留 PEL 待重试: id=%s", message_id)
 

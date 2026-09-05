@@ -2,8 +2,10 @@
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import tasks, workflows
+from app.api.v1.endpoints import admin, tasks, workflows
 
 api_router = APIRouter()
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(workflows.router, prefix="/workflows", tags=["workflows"])
+# 管理面 API：router 级依赖强制 X-Admin-Key，不参与租户隔离
+api_router.include_router(admin.router, prefix="/admin", tags=["admin"])

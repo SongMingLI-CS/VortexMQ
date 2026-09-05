@@ -11,10 +11,13 @@ Delay Dispatcher 的 Lua 只碰这一组 KEY，保证落在同一 Hash Slot。
   {tenant_id}:vortex:tasks:delayed     延迟 ZSet
   {vortex}:tenants                     租户索引 SET（单 Key，Python 侧读取）
   {vortex}:leader                      控制面选主锁
-  {vortex}:metrics:workers             Worker 心跳
+  {vortex}:metrics:workers             Worker 心跳 ZSet（member=consumer，score=unix 时间戳）
+  {vortex}:metrics:workers:load        Worker 负载 Hash（field=consumer，value=JSON 元数据）
 """
 
-from datetime import datetime
+import json
+import time
+from datetime import datetime, timezone
 from uuid import UUID
 
 from redis.asyncio import ConnectionPool, Redis
@@ -99,6 +102,11 @@ def leader_lock_key() -> str:
 
 def worker_heartbeat_key() -> str:
     return control_key("metrics:workers")
+
+
+def worker_load_key() -> str:
+    """Worker 负载元数据 Hash，与心跳 ZSet 同一 {vortex} slot。"""
+    return control_key("metrics:workers:load")
 
 
 def tenant_stream_key(tenant_id: UUID | str, *, high: bool = False) -> str:
@@ -288,3 +296,69 @@ async def ensure_consumer_group(stream_key: str) -> None:
     except ResponseError as exc:
         if "BUSYGROUP" not in str(exc):
             raise
+
+
+def _parse_worker_meta(raw: str | None) -> dict[str, object]:
+    """心跳 Hash 里的 JSON 元数据；旧版本没有该字段时容忍为空。"""
+    if not raw:
+        return {}
+    try:
+        meta = json.loads(raw)
+        return meta if isinstance(meta, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+async def list_worker_heartbeats() -> list[dict[str, object]]:
+    """读取心跳 ZSet + 负载 Hash，返回存活 Worker 详情（Admin /workers 数据源）。
+
+    - 先按 WORKER_HEARTBEAT_TTL_SECONDS 清掉过期 ZSet 成员，剩余成员即存活节点；
+    - 顺带清理负载 Hash 中已无心跳的僵尸 field，避免 Hash 无限增长；
+    - 负载 Hash 与 ZSet 同带 {vortex} Hash Tag，天然同 slot，无 Cluster 跨键问题。
+      ponytail: 负载 Hash 僵尸 field 只在调用本函数时清理。若某部署从不调 /workers，
+      崩溃残留会一直占着字段；量级等于「崩溃过的 Worker 名数量」，页面 /metrics 正常
+      巡检会周期性触发清理，故不引入单独的清扫协程。
+    """
+    redis = get_redis()
+    heartbeat = worker_heartbeat_key()
+    load = worker_load_key()
+    cutoff = time.time() - settings.WORKER_HEARTBEAT_TTL_SECONDS
+
+    await redis.zremrangebyscore(heartbeat, "-inf", cutoff)
+    scored = await redis.zrange(heartbeat, 0, -1, withscores=True) or []
+    if not scored:
+        return []
+
+    names = [str(member) for member, _score in scored]
+    scores = {str(member): float(score) for member, score in scored}
+    raw_loads = await redis.hmget(load, names)
+
+    # 心跳已消失的 Hash field 顺手摘掉；先 hgetall 全量再差集，防止 Hash 缓慢膨胀
+    all_loads = await redis.hgetall(load)
+    stale_fields = [field for field in all_loads if field not in scores]
+    if stale_fields:
+        await redis.hdel(load, *stale_fields)
+
+    workers: list[dict[str, object]] = []
+    for name, raw in zip(names, raw_loads):
+        meta = _parse_worker_meta(raw)
+        in_flight = meta.get("in_flight", 0)
+        started_at = meta.get("started_at")
+        if isinstance(started_at, str):
+            try:
+                parsed_started_at: object = datetime.fromisoformat(started_at)
+            except ValueError:
+                parsed_started_at = None
+        else:
+            parsed_started_at = None
+        workers.append(
+            {
+                "name": name,
+                "hostname": meta.get("hostname"),
+                "pid": meta.get("pid"),
+                "started_at": parsed_started_at,
+                "last_seen": datetime.fromtimestamp(scores[name], tz=timezone.utc),
+                "in_flight": in_flight if isinstance(in_flight, int) else 0,
+            }
+        )
+    return sorted(workers, key=lambda item: str(item["name"]))

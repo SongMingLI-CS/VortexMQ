@@ -7,10 +7,14 @@ Gauge 类指标在 /metrics 抓取时从 Redis 实时读取，避免 API / Worke
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import socket
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from uuid import UUID
 
 from prometheus_client import (
@@ -78,6 +82,34 @@ def render_latest_metrics() -> bytes:
     return generate_latest()
 
 
+# 本进程正在执行的 Handler 并发数。事件循环单线程，同步自增/自减无需加锁。
+_worker_in_flight = 0
+_started_at = time.time()
+
+
+def increment_worker_in_flight() -> None:
+    """进入一条消息处理时调用（必须在首个 await 之前执行）。"""
+    global _worker_in_flight
+    _worker_in_flight += 1
+
+
+def decrement_worker_in_flight() -> None:
+    """消息处理退出时调用；防御性下限 0。"""
+    global _worker_in_flight
+    if _worker_in_flight > 0:
+        _worker_in_flight -= 1
+
+
+def worker_in_flight_count() -> int:
+    """当前正在执行 Handler 的消息数，作为该 Worker 的瞬时负载。"""
+    return _worker_in_flight
+
+
+def _worker_process_started_at() -> str:
+    """Worker 进程启动时间（ISO 8601）。本模块在 Worker 进程内是进程启动时导入。"""
+    return datetime.fromtimestamp(_started_at, tz=timezone.utc).isoformat()
+
+
 def start_metrics_http_server(port: int | None = None) -> None:
     """Worker 进程内另开一个 HTTP 端口供 Prometheus 抓取（不经过 FastAPI）。"""
     bind_port = port if port is not None else settings.WORKER_METRICS_PORT
@@ -86,19 +118,37 @@ def start_metrics_http_server(port: int | None = None) -> None:
 
 
 async def beat_worker_heartbeat(consumer_name: str) -> None:
-    """Worker 存活心跳：ZSet score 为当前 Unix 时间戳。"""
-    from app.core.redis import get_redis, worker_heartbeat_key
+    """Worker 存活心跳：ZSet score 为当前 Unix 时间戳，负载写入同 slot 的 Hash。
+
+    心跳与负载分开存储：ZSet 负责「谁还活着」与过期清理，Hash 负责展示
+    hostname / pid / 进程启动时间 / in_flight。两条命令放同一条 pipeline，
+    避免 Admin /metrics 抓取时读到旧 score 配新元数据。
+    """
+    from app.core.redis import get_redis, worker_heartbeat_key, worker_load_key
 
     redis = get_redis()
-    await redis.zadd(worker_heartbeat_key(), {consumer_name: time.time()})
+    meta = json.dumps(
+        {
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "started_at": _worker_process_started_at(),
+            "in_flight": worker_in_flight_count(),
+        },
+        ensure_ascii=False,
+    )
+    pipe = redis.pipeline(transaction=False)
+    pipe.zadd(worker_heartbeat_key(), {consumer_name: time.time()})
+    pipe.hset(worker_load_key(), consumer_name, meta)
+    await pipe.execute()
 
 
 async def clear_worker_heartbeat(consumer_name: str) -> None:
-    """进程退出时立刻摘掉心跳，避免 Gauge 多报一个僵尸 Worker。"""
-    from app.core.redis import get_redis, worker_heartbeat_key
+    """进程退出时立刻摘掉心跳与负载，避免 Admin /workers 多报一个僵尸 Worker。"""
+    from app.core.redis import get_redis, worker_heartbeat_key, worker_load_key
 
     redis = get_redis()
     await redis.zrem(worker_heartbeat_key(), consumer_name)
+    await redis.hdel(worker_load_key(), consumer_name)
 
 
 async def refresh_runtime_gauges() -> None:

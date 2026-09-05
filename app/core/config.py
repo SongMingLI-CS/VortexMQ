@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
 
+    # 管理面 API 凭证（X-Admin-Key 明文）。为空时 /api/v1/admin/** 全部返回 503，
+    # 避免误部署把跨租户管理接口暴露成匿名可调。必须用随机长串覆盖默认值。
+    ADMIN_API_KEY: str = ""
+
     # 例：postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq"
 

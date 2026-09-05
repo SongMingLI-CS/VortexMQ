@@ -9,6 +9,8 @@ x-app-env: &app-env
   REDIS_DELAYED_KEY: vortex:tasks:delayed
   REDIS_CONSUMER_GROUP: vortex:workers
   WORKER_METRICS_PORT: "8001"
+  # 管理面 API Key（仅演示；生产请换随机长串）
+  ADMIN_API_KEY: change-me-admin-key
 
 services:
   postgres:
