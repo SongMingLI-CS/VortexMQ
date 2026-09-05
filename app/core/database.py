@@ -4,12 +4,13 @@
 设计要点：
 - create_async_engine + async_sessionmaker：全链路 async/await，不阻塞事件循环。
 - expire_on_commit=False：提交后仍可读取 ORM 属性，避免额外 refresh 往返。
-- 当前用 metadata.create_all 建表，适合脚手架阶段；生产环境应切换到 Alembic 迁移。
+- 建表收敛到 Alembic 迁移（migrations/）：多副本并发跑启动期 DDL 会产生
+  数据竞争。init_db 保留 create_all 仅作脚手架兜底，生产环境请执行
+  `python -m alembic upgrade head`。
 """
 
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -51,122 +52,17 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """根据 ORM 元数据创建尚不存在的表，并为已有库补齐新增列。"""
+    """
+    脚手架兜底建表：仅对尚不存在的库执行 create_all，不做任何 ALTER。
+
+    生产环境 / 多副本部署必须改用 Alembic：
+        全新库   -> python -m alembic upgrade head
+        旧版建库 -> python -m alembic stamp head 后再升级
+    这样 schema 演进走 migrations/versions/ 下的版本化迁移，避免多个副本
+    同时执行启动期 DDL 互相竞争（以及 CREATE TYPE ADD VALUE 的事务限制）。
+    """
     from app.models import TaskRecord, Tenant  # noqa: F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # create_all 不会 ALTER 已存在的表；本地第一步库需要补 error_msg
-        await conn.execute(
-            text("ALTER TABLE task_records ADD COLUMN IF NOT EXISTS error_msg TEXT")
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS execute_at "
-                "TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-            )
-        )
-        await conn.execute(
-            text("ALTER TYPE task_status ADD VALUE IF NOT EXISTS 'WAITING'")
-        )
-        await conn.execute(
-            text("ALTER TYPE task_status ADD VALUE IF NOT EXISTS 'CANCELED'")
-        )
-        await conn.execute(
-            text("ALTER TABLE task_records ADD COLUMN IF NOT EXISTS workflow_id UUID")
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS upstream_ids "
-                "JSONB NOT NULL DEFAULT '[]'::jsonb"
-            )
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS downstream_ids "
-                "JSONB NOT NULL DEFAULT '[]'::jsonb"
-            )
-        )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_task_records_workflow_id "
-                "ON task_records (workflow_id)"
-            )
-        )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_task_records_status_updated_at "
-                "ON task_records (status, updated_at)"
-            )
-        )
-        await conn.execute(
-            text("ALTER TABLE task_records ADD COLUMN IF NOT EXISTS result_data JSONB")
-        )
-        await _migrate_tenant_api_key_hash(conn)
-
-
-async def _migrate_tenant_api_key_hash(conn) -> None:
-    """
-    平滑升级：旧库 tenants.api_key 明文 → api_key_hash + api_key_prefix，然后删明文列。
-    新库由 create_all 直接建哈希列，本函数只补索引。
-    """
-    cols = {
-        row[0]
-        for row in (
-            await conn.execute(
-                text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'tenants'"
-                )
-            )
-        ).all()
-    }
-    if not cols:
-        return
-
-    if "api_key_hash" not in cols:
-        await conn.execute(text("ALTER TABLE tenants ADD COLUMN api_key_hash VARCHAR(128)"))
-    if "api_key_prefix" not in cols:
-        await conn.execute(text("ALTER TABLE tenants ADD COLUMN api_key_prefix VARCHAR(32)"))
-
-    if "api_key" in cols:
-        from app.core.security import api_key_prefix, hash_api_key
-
-        rows = (
-            await conn.execute(
-                text(
-                    "SELECT id, api_key FROM tenants "
-                    "WHERE api_key IS NOT NULL AND (api_key_hash IS NULL OR api_key_prefix IS NULL)"
-                )
-            )
-        ).all()
-        for tenant_id, plain in rows:
-            await conn.execute(
-                text(
-                    "UPDATE tenants SET api_key_hash = :h, api_key_prefix = :p WHERE id = :id"
-                ),
-                {"h": hash_api_key(plain), "p": api_key_prefix(plain), "id": tenant_id},
-            )
-        await conn.execute(text("ALTER TABLE tenants DROP COLUMN IF EXISTS api_key"))
-
-    await conn.execute(
-        text("CREATE UNIQUE INDEX IF NOT EXISTS ix_tenants_api_key_hash ON tenants (api_key_hash)")
-    )
-    await conn.execute(
-        text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_tenants_api_key_prefix "
-            "ON tenants (api_key_prefix)"
-        )
-    )
-    empty_or_filled = (
-        await conn.execute(
-            text(
-                "SELECT COUNT(*) FROM tenants "
-                "WHERE api_key_hash IS NULL OR api_key_prefix IS NULL"
-            )
-        )
-    ).scalar_one()
-    if empty_or_filled == 0:
-        await conn.execute(text("ALTER TABLE tenants ALTER COLUMN api_key_hash SET NOT NULL"))
-        await conn.execute(text("ALTER TABLE tenants ALTER COLUMN api_key_prefix SET NOT NULL"))
 

@@ -6,14 +6,12 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
-    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -33,8 +31,6 @@ class _TestRuntime:
     client: TestClient
     db_session: AsyncSession
     redis: Redis
-    db_connection: AsyncConnection
-    db_transaction: Any
     db_engine: AsyncEngine
     admin_engine: AsyncEngine
     schema: str
@@ -49,7 +45,14 @@ async def _empty_lifespan(_app):
 
 @pytest.fixture
 def _test_runtime(monkeypatch: pytest.MonkeyPatch):
-    """Keep all async resources on TestClient's portal event loop."""
+    """Keep all async resources on TestClient's portal event loop.
+
+    隔离模型：每个测试独占一个 PostgreSQL schema 与一段 Redis key 前缀。
+    所有 Session 走独立连接 + 真实提交——schema 本身就是回滚边界，
+    不再把所有会话钉在一条共享连接上做 savepoint。这样 Worker 心跳 /
+    后台协程与测试代码各自持有连接，不会互相踩坏事务（并发连接是
+    生产形态，也是本套件要验证的语义）。
+    """
     schema = f"vortexmq_test_{uuid.uuid4().hex}"
     database_url = os.getenv("TEST_DATABASE_URL", settings.DATABASE_URL)
     redis_url = os.getenv("TEST_REDIS_URL", "redis://localhost:6379/15")
@@ -72,17 +75,18 @@ def _test_runtime(monkeypatch: pytest.MonkeyPatch):
         db_engine = create_async_engine(
             database_url,
             connect_args={"server_settings": {"search_path": schema}},
+            # Worker / 心跳 / Outbox / API 各开短事务，池要够大避免互相等锁
+            pool_size=8,
+            max_overflow=8,
+            pool_pre_ping=True,
         )
         async with db_engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
 
-        db_connection = await db_engine.connect()
-        db_transaction = await db_connection.begin()
         session_factory = async_sessionmaker(
-            bind=db_connection,
+            bind=db_engine,
             class_=AsyncSession,
             expire_on_commit=False,
-            join_transaction_mode="create_savepoint",
         )
         db_session = session_factory()
 
@@ -94,8 +98,6 @@ def _test_runtime(monkeypatch: pytest.MonkeyPatch):
             client=client,
             db_session=db_session,
             redis=redis,
-            db_connection=db_connection,
-            db_transaction=db_transaction,
             db_engine=db_engine,
             admin_engine=admin_engine,
             schema=schema,
@@ -109,9 +111,7 @@ def _test_runtime(monkeypatch: pytest.MonkeyPatch):
 
     async def teardown(current: _TestRuntime) -> None:
         await current.db_session.close()
-        if current.db_transaction.is_active:
-            await current.db_transaction.rollback()
-        await current.db_connection.close()
+        # 先释放全部业务连接，再删 schema，避免 DROP 时还有连接占用
         await current.db_engine.dispose()
 
         current_keys = {key async for key in current.redis.scan_iter(match="*")}
@@ -155,7 +155,7 @@ def client(_test_runtime: _TestRuntime) -> TestClient:
 
 @pytest.fixture
 def db_session(_test_runtime: _TestRuntime) -> AsyncSession:
-    """Session inside an outer transaction that is rolled back after each test."""
+    """Test-scoped session on the isolated schema (real commits; schema is dropped afterwards)."""
     return _test_runtime.db_session
 
 

@@ -14,7 +14,6 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import tenant_stream_key
-from app.worker import processor
 from tests.helpers import (
     create_tenant,
     entries_for_task,
@@ -22,14 +21,19 @@ from tests.helpers import (
     locate_immediate_message,
     post_task,
     process_message,
+    register_handler,
 )
 
 A_KEY = "vxk_iso_a_key_0123456789abcdefgh"
 B_KEY = "vxk_iso_b_key_0123456789abcdefgh"
 
 
-async def _no_delay_execute(task_type: str, payload: dict) -> dict:
-    return {"output": f"done:{task_type}"}
+async def _email_done(payload: dict) -> dict:
+    return {"output": "done:email.send"}
+
+
+async def _order_done(payload: dict) -> dict:
+    return {"output": "done:order.sync"}
 
 
 def test_cross_tenant_result_lookup_is_not_found(
@@ -52,7 +56,7 @@ def test_cross_tenant_result_lookup_is_not_found(
     )
     assert fields["tenant_id"] == str(tenant_a)
 
-    monkeypatch.setattr(processor, "execute_simulated_job", _no_delay_execute)
+    register_handler(monkeypatch, "email.send", _email_done)
     client.portal.call(process_message, message_id, fields, stream_key)
 
     # 属主租户能看到 SUCCESS 结果
@@ -95,7 +99,7 @@ def test_tenant_cannot_see_other_tenants_pending_task(
     message_id, fields = client.portal.call(
         locate_immediate_message, redis_client, task_id, tenant_a
     )
-    monkeypatch.setattr(processor, "execute_simulated_job", _no_delay_execute)
+    register_handler(monkeypatch, "order.sync", _order_done)
     client.portal.call(process_message, message_id, fields, stream_key)
 
     owner_status, owner_body = fetch_result(client, A_KEY, task_id)

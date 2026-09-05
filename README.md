@@ -128,6 +128,12 @@ docker compose up -d --build
 # or: make up
 ```
 
+Schema evolution is versioned with **Alembic** (`migrations/`). On a fresh
+production database run `python -m alembic upgrade head`. If you already have a
+database created by the old scaffold-time `create_all`, run
+`python -m alembic stamp head` once and use migrations from then on. The app
+boot path keeps `create_all` only as a fallback for local scaffolding.
+
 | Port | Service |
 |------|---------|
 | 8000 | API (`/docs`, `/metrics`) |
@@ -143,13 +149,20 @@ API keys are no longer seeded on boot. Issue a tenant key (plaintext is printed 
 python -m app.cli create-tenant default
 ```
 
+Workers execute **registered handlers only**. Tasks are routed by `task_type`
+through `app/worker/registry.py` (`@vortex_registry.register("your.type")`).
+`demo.echo`, `demo.noop`, `demo.sleep` and `demo.fail` are built-in sample
+handlers (`app/worker/handlers.py`) for smoke tests and load runs. A task whose
+type has no handler raises `UnregisteredTaskError` and is taken over by the
+retry / DLQ pipeline, so nothing is silently swallowed.
+
 Immediate task (put the printed key into `X-API-Key`):
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d "{\"task_type\":\"email.send\",\"payload\":{\"to\":\"ops@example.com\"}}"
+  -d "{\"task_type\":\"demo.echo\",\"payload\":{\"hello\":\"world\"}}"
 ```
 
 Delayed task (ZSet path):
@@ -158,7 +171,7 @@ Delayed task (ZSet path):
 curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d "{\"task_type\":\"delay.wakeup\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
+  -d "{\"task_type\":\"demo.echo\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
 ```
 
 Load mix (70% immediate / 20% delayed / 10% poison pills):
@@ -179,7 +192,8 @@ app/api/          HTTP, tenant auth via X-API-Key
 app/core/         config, async engine, Redis pool, Lua, Prometheus
 app/models/       Tenant, TaskRecord
 app/services/     submit, Outbox Sweeper, Delay Dispatcher
-app/worker/       consumer loop, backoff, graceful stop
+app/worker/       consumer loop, handler registry, backoff, graceful stop
+migrations/       Alembic schema migrations
 scripts/          asyncio + aiohttp stress client
 ```
 

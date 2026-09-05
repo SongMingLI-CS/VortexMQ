@@ -16,6 +16,7 @@ from app.core.security import api_key_prefix, hash_api_key
 from app.models.task import TaskRecord
 from app.models.tenant import Tenant
 from app.worker import processor
+from tests.helpers import register_handler
 
 
 async def _create_test_tenant(session: AsyncSession, api_key: str) -> UUID:
@@ -97,12 +98,11 @@ def test_immediate_task_full_lifecycle(
     message_id, fields = matching[0]
     assert fields["tenant_id"] == str(tenant_id)
 
-    async def execute_without_delay(task_type: str, payload: dict) -> dict:
-        assert task_type == "email.send"
+    async def execute_without_delay(payload: dict) -> dict:
         assert payload["to"] == "mvp@example.com"
         return {"output": "email accepted"}
 
-    monkeypatch.setattr(processor, "execute_simulated_job", execute_without_delay)
+    register_handler(monkeypatch, "email.send", execute_without_delay)
     client.portal.call(_run_worker, message_id, fields, stream_key)
 
     result_response = client.get(

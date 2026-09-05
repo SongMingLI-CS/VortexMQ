@@ -130,6 +130,11 @@ docker compose up -d --build
 # 或: make up
 ```
 
+Schema 演进统一走 **Alembic**（`migrations/`）。全新生产数据库先执行
+`python -m alembic upgrade head`；由旧脚手架 `create_all` 建出来的库请先执行
+一次 `python -m alembic stamp head`，此后一律走版本化迁移。应用启动路径只保留
+`create_all` 作为本地脚手架兜底。
+
 | 端口 | 服务 |
 |------|------|
 | 8000 | API（`/docs`、`/metrics`） |
@@ -145,13 +150,19 @@ API 不再自动写入演示密钥。签发租户（明文只打印一次）：
 python -m app.cli create-tenant default
 ```
 
+Worker 只执行**已注册的 Handler**。任务按 `task_type` 经 `app/worker/registry.py`
+路由（`@vortex_registry.register("your.type")`）。`demo.echo`、`demo.noop`、
+`demo.sleep`、`demo.fail` 是内置示例 Handler（`app/worker/handlers.py`），供冒烟
+与压测复用。没有对应 Handler 的任务会抛 `UnregisteredTaskError`，由
+重试 / DLQ 管道接管，不会被静默吞掉。
+
 即时任务（把打印出的 Key 填进 `X-API-Key`）：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d "{\"task_type\":\"email.send\",\"payload\":{\"to\":\"ops@example.com\"}}"
+  -d "{\"task_type\":\"demo.echo\",\"payload\":{\"hello\":\"world\"}}"
 ```
 
 延迟任务（走 ZSet）：
@@ -160,7 +171,7 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
 curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d "{\"task_type\":\"delay.wakeup\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
+  -d "{\"task_type\":\"demo.echo\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
 ```
 
 混合压测（70% 即时 / 20% 延迟 / 10% 毒药任务）：
@@ -181,7 +192,8 @@ app/api/          HTTP，X-API-Key 租户鉴权
 app/core/         配置、异步引擎、Redis 连接池、Lua、Prometheus
 app/models/       Tenant、TaskRecord
 app/services/     任务提交、Outbox Sweeper、Delay Dispatcher
-app/worker/       消费循环、退避、优雅停机
+app/worker/       消费循环、Handler 注册表、退避、优雅停机
+migrations/       Alembic 迁移脚本
 scripts/          asyncio + aiohttp 压测客户端
 ```
 

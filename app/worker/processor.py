@@ -1,8 +1,12 @@
 """
-单条 Stream 消息的处理：RUNNING → 执行 → SUCCESS / PENDING+延迟 / DLQ，最后 XACK。
+单条 Stream 消息的处理：RUNNING → Registry 分发执行 → SUCCESS / PENDING+延迟 / DLQ，最后 XACK。
 
 重试不再依赖 Sweeper 的 30 秒扫描，而是写入 ZSet 做指数退避；
 到期后由 Delay Dispatcher 的 Lua 脚本原子转入 Stream。
+
+任务类型路由：Worker 只认识 app/worker/registry 里注册过的 Handler。
+查不到执行器会抛 UnregisteredTaskError，进入与业务失败相同的
+重试 / DLQ 管道，保证「投了没处理器」也不会被静默吞掉。
 """
 
 from __future__ import annotations
@@ -31,6 +35,9 @@ from app.crud.task import (
 )
 from app.models.task import TaskRecord
 from app.services.workflow import awaken_downstream, cancel_descendants
+# 导入内置 demo.* Handler（副作用：模块 import 期完成注册）
+from app.worker import handlers as _demo_handlers  # noqa: F401
+from app.worker.registry import UnregisteredTaskError, vortex_registry
 
 logger = logging.getLogger("vortexmq.worker")
 
@@ -48,12 +55,17 @@ async def ack_message(message_id: str, stream_key: str) -> None:
     )
 
 
-async def execute_simulated_job(task_type: str, payload: dict) -> dict:
-    """模拟业务处理并返回结果；payload.force_fail=true 时主动抛错。"""
-    await asyncio.sleep(3)
-    if payload.get("force_fail"):
-        raise RuntimeError(f"模拟业务失败: task_type={task_type}")
-    return {"output": f"data_from_{task_type}"}
+def resolve_handler(task_type: str):
+    """
+    按 task_type 查注册表。
+
+    未注册时抛 UnregisteredTaskError：调用方把它当作普通业务异常处理，
+    重试计数 +1 / 指数退避 / 超过上限进 DLQ 的管道自动接管该消息。
+    """
+    handler = vortex_registry.get(task_type)
+    if handler is None:
+        raise UnregisteredTaskError(task_type)
+    return handler
 
 
 def compute_next_execute_at(retry_count: int) -> datetime:
@@ -199,11 +211,12 @@ async def handle_message(message_id: str, fields: dict[str, str], *, stream_key:
     )
 
     try:
+        # Registry 路由：未注册的 task_type 在此抛 UnregisteredTaskError，
+        # 与业务异常走同一条 _persist_failure（重试退避 / DLQ）管道。
+        handler = resolve_handler(task_type)
         async with track_task_duration():
             # 长任务执行期间持续刷新租约，避免被 Outbox / 二次 CAS 重复执行（B2）
-            result_data = await _run_with_lease_heartbeat(
-                task_id, execute_simulated_job(task_type, payload)
-            )
+            result_data = await _run_with_lease_heartbeat(task_id, handler(payload))
     except Exception:
         stack = traceback.format_exc()
         logger.exception(
@@ -223,7 +236,7 @@ async def handle_message(message_id: str, fields: dict[str, str], *, stream_key:
         return
 
     logger.info(
-        "任务模拟执行完成: tenant=%s task_id=%s task_type=%s",
+        "任务执行完成: tenant=%s task_id=%s task_type=%s",
         tenant_name,
         task_id,
         task_type,

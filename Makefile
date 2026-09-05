@@ -5,7 +5,7 @@ PYTHON ?= python
 COMPOSE ?= docker compose
 STRESS_ARGS ?=
 
-.PHONY: up down logs-worker stress
+.PHONY: up down logs-worker stress migrate stamp
 
 # 构建并后台启动全部容器：Postgres、Redis、API、Worker、Prometheus、Grafana
 up:
@@ -18,6 +18,13 @@ down:
 # 跟踪 Worker 日志，观察消费、退避重试、DLQ
 logs-worker:
 	$(COMPOSE) logs -f --tail=200 worker
+
+# 版本化 schema 迁移（Alembic）。全新库 upgrade；旧 create_all 库先 stamp 一次
+migrate:
+	$(PYTHON) -m alembic upgrade head
+
+stamp:
+	$(PYTHON) -m alembic stamp head
 
 # 对宿主机映射的 API 发起混合压测。须先签发密钥：
 #   python -m app.cli create-tenant default

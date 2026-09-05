@@ -27,3 +27,7 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# 会话工具自动生成的助手指引（非项目交付物）
+.clinerules/ponytail.md
+.cursor/rules/

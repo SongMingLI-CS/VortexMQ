@@ -20,7 +20,6 @@ from app.core.clock import utcnow
 from app.core.enums import TaskStatus
 from app.core.redis import tenant_stream_key
 from app.services import outbox
-from app.worker import processor
 from tests.helpers import (
     create_tenant,
     delete_stream_entries,
@@ -29,6 +28,7 @@ from tests.helpers import (
     force_status,
     post_task,
     process_message,
+    register_handler,
 )
 
 KEY_A = "vxk_outbox_a_key_0123456789abcdefgh"
@@ -38,8 +38,12 @@ KEY_D = "vxk_outbox_d_key_0123456789abcdefgh"
 KEY_E = "vxk_outbox_e_key_0123456789abcdefgh"
 
 
-async def _instant_execute(task_type: str, payload: dict) -> dict:
-    return {"output": f"done:{task_type}"}
+async def _instant_email(payload: dict) -> dict:
+    return {"output": "done:email.send"}
+
+
+async def _instant_report(payload: dict) -> dict:
+    return {"output": "done:report.build"}
 
 
 def _stale(seconds: int = 120) -> object:
@@ -80,7 +84,7 @@ def test_sweep_republishes_lost_pending_and_refreshes_lease(
     # 投递成功后 updated_at 已刷新：立即再扫一轮不会重复认领
     assert client.portal.call(outbox.sweep_pending_tasks) == 0
 
-    monkeypatch.setattr(processor, "execute_simulated_job", _instant_execute)
+    register_handler(monkeypatch, "email.send", _instant_email)
     message_id, fields = entries[0]
     client.portal.call(process_message, message_id, fields, stream_key)
     record = client.portal.call(fetch_task, db_session, task_id)
@@ -115,11 +119,11 @@ def test_duplicate_compensation_runs_business_once(
 
     calls: list[str] = []
 
-    async def counting_execute(task_type: str, payload: dict) -> dict:
-        calls.append(task_type)
+    async def counting_execute(payload: dict) -> dict:
+        calls.append("order.sync")
         return {"output": "ok"}
 
-    monkeypatch.setattr(processor, "execute_simulated_job", counting_execute)
+    register_handler(monkeypatch, "order.sync", counting_execute)
     for message_id, fields in all_entries:
         client.portal.call(process_message, message_id, fields, stream_key)
 
@@ -161,7 +165,7 @@ def test_stale_running_reclaimed_and_rerun_to_success(
     entries = client.portal.call(entries_for_task, redis_client, stream_key, task_id)
     assert len(entries) == 1, "回收后应重新唤醒任务"
 
-    monkeypatch.setattr(processor, "execute_simulated_job", _instant_execute)
+    register_handler(monkeypatch, "report.build", _instant_report)
     message_id, fields = entries[0]
     client.portal.call(process_message, message_id, fields, stream_key)
     record = client.portal.call(fetch_task, db_session, task_id)

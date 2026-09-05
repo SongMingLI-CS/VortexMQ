@@ -33,6 +33,7 @@ from tests.helpers import (
     post_task,
     process_message,
     read_new_message,
+    register_handler,
 )
 
 KEY = "vxk_idem_key_0123456789abcdefghij"
@@ -46,8 +47,8 @@ def _claim_with_lease(session: AsyncSession, task_id: UUID):
 
 
 async def _counting_execute(calls: list[str]) -> None:
-    async def execute(task_type: str, payload: dict) -> dict:
-        calls.append(task_type)
+    async def execute(payload: dict) -> dict:
+        calls.append("email.send")
         return {"output": "ok"}
 
     return execute
@@ -72,8 +73,8 @@ def test_duplicate_message_after_success_executes_once(
     )
 
     calls: list[str] = []
-    monkeypatch.setattr(
-        processor, "execute_simulated_job", client.portal.call(_counting_execute, calls)
+    register_handler(
+        monkeypatch, "email.send", client.portal.call(_counting_execute, calls)
     )
 
     client.portal.call(process_message, message_id, fields, stream_key)
@@ -114,8 +115,8 @@ def test_message_during_fresh_running_lease_is_not_executed(
     client.portal.call(force_status, db_session, task_id, TaskStatus.RUNNING)
 
     calls: list[str] = []
-    monkeypatch.setattr(
-        processor, "execute_simulated_job", client.portal.call(_counting_execute, calls)
+    register_handler(
+        monkeypatch, "email.send", client.portal.call(_counting_execute, calls)
     )
 
     dup_id = client.portal.call(redis_client.xadd, stream_key, fields)
@@ -145,13 +146,13 @@ def test_success_persist_failure_keeps_message_in_pel(
     )
     assert message_id is not None
 
-    async def _ok_execute(task_type: str, payload: dict) -> dict:
+    async def _ok_execute(payload: dict) -> dict:
         return {"output": "ok"}
 
     async def _fail_persist(_task_id: UUID, _result_data: dict) -> bool:
         return False
 
-    monkeypatch.setattr(processor, "execute_simulated_job", _ok_execute)
+    register_handler(monkeypatch, "email.send", _ok_execute)
     monkeypatch.setattr(processor, "_persist_success", _fail_persist)
 
     client.portal.call(process_message, message_id, fields, stream_key)
@@ -181,7 +182,7 @@ def test_failure_persist_failure_keeps_message_in_pel(
     )
     assert message_id is not None
 
-    async def _boom_execute(task_type: str, payload: dict) -> dict:
+    async def _boom_execute(payload: dict) -> dict:
         raise RuntimeError("boom")
 
     async def _fail_failure_persist(
@@ -189,7 +190,7 @@ def test_failure_persist_failure_keeps_message_in_pel(
     ) -> tuple[bool, str | None]:
         return False, None
 
-    monkeypatch.setattr(processor, "execute_simulated_job", _boom_execute)
+    register_handler(monkeypatch, "email.send", _boom_execute)
     monkeypatch.setattr(processor, "_persist_failure", _fail_failure_persist)
 
     client.portal.call(process_message, message_id, fields, stream_key)
@@ -256,13 +257,13 @@ def test_long_task_with_lease_heartbeat_is_not_reexecuted(
         release = asyncio.Event()
         executions: list[str] = []
 
-        async def slow_job(task_type: str, payload: dict) -> dict:
-            executions.append(task_type)
+        async def slow_job(payload: dict) -> dict:
+            executions.append("long.running")
             start.set()
             await release.wait()  # 让任务“跑”得比 200ms 租约窗口更久
             return {"output": "slow-done"}
 
-        monkeypatch.setattr(processor, "execute_simulated_job", slow_job)
+        register_handler(monkeypatch, "long.running", slow_job)
 
         worker_task = asyncio.create_task(
             process_message(message_id, fields, stream_key)

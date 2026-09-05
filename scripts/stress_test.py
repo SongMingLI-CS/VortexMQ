@@ -31,7 +31,7 @@ from typing import Any
 
 import aiohttp
 
-IMMEDIATE_TASK_TYPES = ("email.send", "order.sync", "report.export", "sms.notify")
+IMMEDIATE_TASK_TYPES = ("demo.echo", "demo.noop", "demo.sleep")
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,9 +74,15 @@ def build_payload(kind: str, api_keys: tuple[str, ...]) -> tuple[dict[str, Any],
     """
     api_key = random.choice(api_keys)
     if kind == "immediate":
-        body: dict[str, Any] = {
-            "task_type": random.choice(IMMEDIATE_TASK_TYPES),
-            "payload": {"source": "stress", "kind": "immediate"},
+        # demo.* 是内置示例 Handler（app/worker/handlers.py）。
+        # demo.sleep 带小随机 sleep_seconds，模拟有耗时的业务负载。
+        task_type = random.choice(IMMEDIATE_TASK_TYPES)
+        payload: dict[str, Any] = {"source": "stress", "kind": "immediate"}
+        if task_type == "demo.sleep":
+            payload["sleep_seconds"] = random.uniform(0.2, 1.2)
+        body = {
+            "task_type": task_type,
+            "payload": payload,
             "priority": random.randint(0, 20),
         }
         return body, api_key
@@ -85,15 +91,20 @@ def build_payload(kind: str, api_keys: tuple[str, ...]) -> tuple[dict[str, Any],
         delay_seconds = random.randint(5, 45)
         execute_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         body = {
-            "task_type": "delay.wakeup",
-            "payload": {"source": "stress", "kind": "delayed", "delay_seconds": delay_seconds},
+            "task_type": "demo.sleep",
+            "payload": {
+                "source": "stress",
+                "kind": "delayed",
+                "delay_seconds": delay_seconds,
+            },
             "priority": random.randint(0, 20),
             "execute_at": execute_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         return body, api_key
 
+    # 毒药任务：demo.fail 恒定为业务失败，走指数退避并最终进入 DLQ。
     body = {
-        "task_type": "chaos.poison",
+        "task_type": "demo.fail",
         "payload": {"force_fail": True, "source": "stress", "kind": "poison"},
         "priority": 0,
     }

@@ -4,14 +4,15 @@ Integration-test 共享工具。
 约定：
 - 所有 async 函数都运行在 TestClient 的 portal 事件循环上，测试侧通过
   ``client.portal.call(func, *args)`` 调用。
-- 涉及数据库的 helper 结束后会 commit 当前 savepoint，便于同连接上的
-  其他会话（API 依赖 / Worker / Outbox）看到变更。
+- 隔离模型：每个测试独占一个 PostgreSQL schema。涉及数据库的 helper 结束后
+  会 commit 当前事务（真实提交），让其他会话（API 依赖 / Worker / Outbox）
+  跨连接看到变更；schema 在测试收尾时整库 DROP，无需回滚。
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -20,12 +21,14 @@ from redis.asyncio import Redis
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import utcnow
 from app.core.config import settings
 from app.core.enums import TaskStatus
 from app.core.redis import ensure_consumer_group, tenant_stream_key
 from app.core.security import api_key_prefix, hash_api_key
 from app.models.task import TaskRecord
 from app.models.tenant import Tenant
+from app.worker.registry import vortex_registry
 
 DEFAULT_CONSUMER = "itest-consumer"
 
@@ -46,6 +49,15 @@ async def create_tenant(
     await session.commit()
     await session.refresh(tenant)
     return tenant.id
+
+
+def register_handler(monkeypatch: object, task_type: str, handler: Any) -> None:
+    """把测试专用 Handler 注入全局注册表，测试结束由 monkeypatch 自动还原。
+
+    新 Worker 按 task_type 查 vortex_registry 分发执行（P1-8），
+    因此需要执行器的测试改为注册临时 Handler，而不是替换处理器内部函数。
+    """
+    monkeypatch.setitem(vortex_registry.handlers, task_type, handler)
 
 
 def post_task(
@@ -83,7 +95,7 @@ def fetch_result(client: TestClient, api_key: str, task_id: UUID) -> tuple[int, 
 
 
 async def fetch_task(session: AsyncSession, task_id: UUID) -> TaskRecord:
-    """读取任务记录并结束本会话 savepoint，返回 ORM 对象。
+    """读取任务记录并结束本会话当前事务，返回 ORM 对象。
 
     populate_existing：同一 fixture 会话的 identity map 可能持有过期对象
     （expire_on_commit=False），必须用 DB 当前行覆盖后再返回。
@@ -178,6 +190,28 @@ async def process_message(
     from app.worker.processor import handle_message
 
     await handle_message(message_id, fields, stream_key=stream_key)
+
+
+async def rearm_into_past(
+    session: AsyncSession,
+    task_id: UUID,
+    redis: Redis,
+    stream_key: str,
+    fields: dict[str, str],
+) -> str:
+    """模拟「退避到期」：把 execute_at 拨回过去并新投递一条消息。
+
+    失败重试后的任务处于 PENDING + 未来 execute_at；真实环境由 Delay
+    Dispatcher 在到期后搬进 Stream。测试不真实等待退避时间，因此直接
+    把 execute_at 改为过去并 XADD 一条新消息，返回新消息 ID。
+    """
+    await session.execute(
+        update(TaskRecord)
+        .where(TaskRecord.task_id == task_id)
+        .values(execute_at=utcnow() - timedelta(seconds=1))
+    )
+    await session.commit()
+    return await redis.xadd(stream_key, fields)
 
 
 async def locate_immediate_message(
