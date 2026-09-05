@@ -174,6 +174,72 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -d "{\"task_type\":\"demo.echo\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
 ```
 
+### Using the Python SDK
+
+A thin client SDK ships in `sdk/python/` so business callers don't hand-roll the
+HTTP calls or the DAG JSON. It wraps `httpx` (sync + async) and injects
+`X-API-Key` on every request. Require `httpx` (already a dev/test dependency) and
+put `sdk/python` on your `PYTHONPATH` (or install it as a package later).
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from vortexmq_client import VortexMQClient, Workflow
+
+client = VortexMQClient("http://127.0.0.1:8000", "<your-api-key>")
+
+# 1. Immediate task
+task_id = client.submit_task("demo.echo", {"hello": "world"})
+
+# 2. Delayed task (lands in the ZSet until execute_at)
+task_id = client.submit_task(
+    "demo.echo",
+    {"hello": "later"},
+    execute_at=datetime.now(timezone.utc) + timedelta(hours=1),
+)
+
+# 3. Poll the result: SUCCESS returns result_data; in-flight returns status
+result = client.get_task_result(task_id)
+print(result["status"], result.get("result_data"))
+
+# 4. Compose a DAG with the fluent builder
+wf = Workflow()
+node_a = wf.add_node("node_a", "etl.extract", {"source": "db"})
+node_b = wf.add_node("node_b", "etl.transform", {}, depends_on=[node_a])
+
+task_ids = client.submit_workflow(wf)  # -> ["<a-task-id>", "<b-task-id>"]
+```
+
+Async callers use `AsyncVortexMQClient` with the same methods awaited
+(`await client.submit_task(...)`, `await client.get_task_result(...)`,
+`await client.submit_workflow(...)`) and `async with`.
+
+The Admin API (task hall / DLQ replay / force cancel / worker monitoring) uses a
+separate `X-Admin-Key` header instead of tenant auth. Set `ADMIN_API_KEY` in your
+`.env` first:
+
+```bash
+# Task hall: cross-tenant filters + pagination (status / tenant_name / tenant_id / created_from / created_to)
+curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page=1&page_size=20" \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# Replay a DLQ task: back to PENDING and re-wake the Worker
+curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/replay \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# Force-cancel a backlog task (PENDING / RUNNING / WAITING; cascades to WAITING children)
+curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/cancel \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# Worker monitoring (heartbeat-alive nodes + in_flight load)
+curl -sS http://127.0.0.1:8000/api/v1/admin/workers \
+  -H "X-Admin-Key: <your-admin-key>"
+```
+
+If `ADMIN_API_KEY` is not set, every admin endpoint returns `503` so a mis-deploy
+cannot expose the cross-tenant control plane anonymously. Generate a strong key
+with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+
 Load mix (70% immediate / 20% delayed / 10% poison pills):
 
 ```bash

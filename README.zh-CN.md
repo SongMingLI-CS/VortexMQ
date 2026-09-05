@@ -174,6 +174,71 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -d "{\"task_type\":\"demo.echo\",\"execute_at\":\"2026-08-17T12:00:00Z\",\"payload\":{}}"
 ```
 
+### 使用 Python SDK
+
+`sdk/python/` 内置一个轻量客户端 SDK，业务方无需
+手写 HTTP 调用与 DAG JSON。底层基于 `httpx`（同步 + 异步），每次请求自动注入
+`X-API-Key`。依赖 `httpx`（已在开发 / 测试依赖中），把 `sdk/python` 加入
+`PYTHONPATH` 即可使用（未来可打包推送到 PyPI）。
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from vortexmq_client import VortexMQClient, Workflow
+
+client = VortexMQClient("http://127.0.0.1:8000", "<your-api-key>")
+
+# 1. 即时任务
+task_id = client.submit_task("demo.echo", {"hello": "world"})
+
+# 2. 延迟任务（到期前只进入 ZSet）
+task_id = client.submit_task(
+    "demo.echo",
+    {"hello": "later"},
+    execute_at=datetime.now(timezone.utc) + timedelta(hours=1),
+)
+
+# 3. 轮询结果：SUCCESS 返回 result_data，未完成返回 status
+result = client.get_task_result(task_id)
+print(result["status"], result.get("result_data"))
+
+# 4. 用 Fluent 构建器编排 DAG
+wf = Workflow()
+node_a = wf.add_node("node_a", "etl.extract", {"source": "db"})
+node_b = wf.add_node("node_b", "etl.transform", {}, depends_on=[node_a])
+
+task_ids = client.submit_workflow(wf)  # -> ["<a-task-id>", "<b-task-id>"]
+```
+
+异步调用方改用 `AsyncVortexMQClient`，同名方法 `await` 即可
+（`await client.submit_task(...)`、`await client.get_task_result(...)`、
+`await client.submit_workflow(...)`），并用 `async with` 管理连接。
+
+管理面 API（任务大厅 / DLQ 重放 / 强制取消 / Worker 节点监控）使用独立的
+`X-Admin-Key`，不经过租户鉴权，需先在 `.env` 设置 `ADMIN_API_KEY`：
+
+```bash
+# 任务大厅：跨租户筛选 + 分页（status / tenant_name / tenant_id / created_from / created_to）
+curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page=1&page_size=20" \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# DLQ 重放：捞回 PENDING 并重新叫醒 Worker
+curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/replay \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# 强制取消积压任务（PENDING / RUNNING / WAITING，WAITING 下游级联取消）
+curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/cancel \
+  -H "X-Admin-Key: <your-admin-key>"
+
+# Worker 节点监控（心跳存活 + in_flight 负载）
+curl -sS http://127.0.0.1:8000/api/v1/admin/workers \
+  -H "X-Admin-Key: <your-admin-key>"
+```
+
+未设置 `ADMIN_API_KEY` 时以上管理接口统一返回 `503`，避免误部署把跨租户
+管理面暴露成匿名可调。Key 用随机长串生成，例如
+`python -c "import secrets; print(secrets.token_urlsafe(48))"`。
+
 混合压测（70% 即时 / 20% 延迟 / 10% 毒药任务）：
 
 ```bash
