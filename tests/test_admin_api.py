@@ -376,3 +376,51 @@ def test_workers_endpoint_lists_alive_and_prunes_stale(
     empty = client.get("/api/v1/admin/workers", headers=_admin_headers()).json()
     assert empty == []
 
+
+def test_workflow_detail_endpoint_returns_dag_edges(
+    client: TestClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """GET /admin/workflows/{id} 返回整张 DAG 的节点与上下游边（供控制台可视化）。"""
+    assert client.portal is not None
+    _enable_admin(monkeypatch)
+    api_key = "vxk_wf_detail_0123456789abcdefgh"
+    client.portal.call(create_tenant, db_session, api_key)
+
+    wf = client.post(
+        "/api/v1/workflows",
+        headers={"X-API-Key": api_key},
+        json={
+            "nodes": [
+                {"node_id": "A", "task_type": "demo.noop", "payload": {}},
+                {
+                    "node_id": "B",
+                    "task_type": "demo.echo",
+                    "payload": {},
+                    "depends_on": ["A"],
+                },
+            ]
+        },
+    )
+    assert wf.status_code == 201
+    workflow_id = wf.json()["workflow_id"]
+    a_id = next(t["task_id"] for t in wf.json()["tasks"] if t["node_id"] == "A")
+    b_id = next(t["task_id"] for t in wf.json()["tasks"] if t["node_id"] == "B")
+
+    detail = client.get(
+        f"/api/v1/admin/workflows/{workflow_id}", headers=_admin_headers()
+    )
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["workflow_id"] == workflow_id
+    nodes = {n["task_id"]: n for n in body["nodes"]}
+    assert set(nodes) == {a_id, b_id}
+    assert nodes[a_id]["upstream_ids"] == []
+    assert nodes[a_id]["downstream_ids"] == [b_id]
+    assert nodes[b_id]["upstream_ids"] == [a_id]
+    assert nodes[b_id]["downstream_ids"] == []
+
+    missing = client.get(
+        f"/api/v1/admin/workflows/{uuid.uuid4()}", headers=_admin_headers()
+    )
+    assert missing.status_code == 404
+

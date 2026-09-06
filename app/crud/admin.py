@@ -105,3 +105,15 @@ async def get_tenant_name(session: AsyncSession, tenant_id: UUID) -> str:
     """按租户 ID 查租户名；不存在返回空串（任务行不可能引用不存在的租户）。"""
     result = await session.execute(select(Tenant.name).where(Tenant.id == tenant_id))
     return result.scalar_one_or_none() or ""
+
+
+async def list_workflow_tasks(
+    session: AsyncSession, workflow_id: UUID
+) -> list[TaskRecord]:
+    """按 workflow_id 捞取整张 DAG 的任务（跨租户，仅 Admin 面使用）。"""
+    stmt = (
+        select(TaskRecord)
+        .where(TaskRecord.workflow_id == workflow_id)
+        .order_by(TaskRecord.created_at, TaskRecord.task_id)
+    )
+    return list((await session.execute(stmt)).scalars())

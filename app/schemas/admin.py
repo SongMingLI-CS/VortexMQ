@@ -50,3 +50,23 @@ class AdminWorkerInfo(BaseModel):
     started_at: datetime | None = None
     last_seen: datetime
     in_flight: int = 0
+
+
+class AdminWorkflowNode(BaseModel):
+    """工作流 DAG 中的一个节点（含上下游边，供控制台可视化）。"""
+
+    task_id: UUID
+    task_type: str
+    status: TaskStatus
+    priority: int
+    upstream_ids: list[UUID]
+    downstream_ids: list[UUID]
+    error_msg: str | None = None
+    created_at: datetime
+
+
+class AdminWorkflowDetail(BaseModel):
+    """一次 DAG 工作流的完整节点 + 边。"""
+
+    workflow_id: UUID
+    nodes: list[AdminWorkflowNode]

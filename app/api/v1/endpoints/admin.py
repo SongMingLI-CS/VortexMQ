@@ -17,12 +17,19 @@ from app.api.deps import get_admin
 from app.core.database import get_db
 from app.core.enums import TaskStatus
 from app.core.redis import list_worker_heartbeats
-from app.crud.admin import count_admin_tasks, get_tenant_name, list_admin_tasks
+from app.crud.admin import (
+    count_admin_tasks,
+    get_tenant_name,
+    list_admin_tasks,
+    list_workflow_tasks,
+)
 from app.models.task import TaskRecord
 from app.schemas.admin import (
     AdminTaskItem,
     AdminTaskListResponse,
     AdminWorkerInfo,
+    AdminWorkflowDetail,
+    AdminWorkflowNode,
 )
 from app.services.admin import (
     AdminTaskNotFoundError,
@@ -171,3 +178,37 @@ async def cancel_task_endpoint(
 async def list_workers() -> list[AdminWorkerInfo]:
     heartbeats = await list_worker_heartbeats()
     return [AdminWorkerInfo(**item) for item in heartbeats]
+
+
+@router.get(
+    "/workflows/{workflow_id}",
+    response_model=AdminWorkflowDetail,
+    summary="查询工作流 DAG",
+    description="按 workflow_id 返回整张 DAG 的节点与上下游边，供控制台可视化。",
+    responses={
+        404: {"description": "工作流不存在"},
+    },
+)
+async def get_workflow_detail(
+    workflow_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> AdminWorkflowDetail:
+    records = await list_workflow_tasks(db, workflow_id)
+    if not records:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="工作流不存在"
+        )
+    nodes = [
+        AdminWorkflowNode(
+            task_id=record.task_id,
+            task_type=record.task_type,
+            status=record.status,
+            priority=record.priority,
+            upstream_ids=[UUID(item) for item in record.upstream_ids],
+            downstream_ids=[UUID(item) for item in record.downstream_ids],
+            error_msg=record.error_msg,
+            created_at=record.created_at,
+        )
+        for record in records
+    ]
+    return AdminWorkflowDetail(workflow_id=workflow_id, nodes=nodes)
