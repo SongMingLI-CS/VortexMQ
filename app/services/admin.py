@@ -18,7 +18,7 @@ from app.core.enums import TaskStatus
 from app.core.redis import get_redis, schedule_wakeup, tenant_delayed_key
 from app.crud.task import get_task_for_update
 from app.models.task import TaskRecord
-from app.services.workflow import cancel_descendants
+from app.services.workflow import cancel_descendants, revive_canceled_descendants
 
 logger = logging.getLogger("vortexmq.admin")
 
@@ -38,7 +38,7 @@ class AdminTaskStateError(ValueError):
 
 
 async def replay_task(session: AsyncSession, task_id: UUID) -> TaskRecord:
-    """DLQ -> PENDING：重置重试计数与错误信息，执行时间为现在并重新叫醒。"""
+    """DLQ -> PENDING：重置重试计数与错误信息，复活被级联取消的下游，并重新叫醒。"""
     task = await get_task_for_update(session, task_id)
     if task is None:
         raise AdminTaskNotFoundError(task_id)
@@ -52,6 +52,9 @@ async def replay_task(session: AsyncSession, task_id: UUID) -> TaskRecord:
     task.error_msg = None
     task.execute_at = utcnow()
     task.updated_at = utcnow()
+    # 本任务上次 DLQ 时级联取消的下游一并复活为 WAITING（同一事务）。
+    # 否则重放只救活单个节点，被取消的子孙永远等不到上游而卡死整张 DAG。
+    await revive_canceled_descendants(session, task)
     await session.commit()
 
     try:

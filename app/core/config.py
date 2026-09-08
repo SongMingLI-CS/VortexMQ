@@ -20,7 +20,11 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "VortexMQ"
     APP_VERSION: str = "0.1.0"
-    DEBUG: bool = True
+    # 默认关闭调试：直接 uvicorn 启动时不会把 SQL（含 payload INSERT）打进日志。
+    # 需要框架级调试输出时再显式打开。
+    DEBUG: bool = False
+    # SQLAlchemy engine echo 独立开关。不要把敏感 payload 通过 SQL 日志泄漏出去。
+    SQL_ECHO: bool = False
 
     # 管理面 API 凭证（X-Admin-Key 明文）。为空时 /api/v1/admin/** 全部返回 503，
     # 避免误部署把跨租户管理接口暴露成匿名可调。必须用随机长串覆盖默认值。
@@ -43,7 +47,11 @@ class Settings(BaseSettings):
     REDIS_CONSUMER_GROUP: str = "vortex:workers"
     # 为空时 Worker 用 hostname-pid 生成，保证多实例消费者名不冲突
     WORKER_CONSUMER_NAME: str = ""
-    # XREADGROUP 阻塞毫秒数；到期后循环继续，便于响应 Ctrl+C
+    # Worker 单进程最大并发在途消息数：>1 时预取多条并行执行（至少一次语义下
+    # 副作用需幂等）。提高并发时请同步调大 PostgreSQL 连接池（engine pool_size）。
+    WORKER_MAX_IN_FLIGHT: int = 4
+    # 空闲等待毫秒数：无消息时用 XREADGROUP BLOCK 阻塞等待新消息 / 停机信号，
+    # 到期后循环继续，便于响应 Ctrl+C
     WORKER_BLOCK_MS: int = 5000
     # PEL 中空闲超过该毫秒数的消息可被其他 Worker XAUTOCLAIM
     WORKER_CLAIM_IDLE_MS: int = 30000

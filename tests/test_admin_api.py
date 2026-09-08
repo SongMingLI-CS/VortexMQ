@@ -31,6 +31,8 @@ from tests.helpers import (
     fetch_task,
     locate_immediate_message,
     process_message,
+    read_new_message,
+    register_handler,
 )
 
 ADMIN_KEY = "vxk_admin_secret_0123456789abcdefg"
@@ -254,6 +256,114 @@ def test_replay_dlq_back_to_pending_and_rerun_to_success(
     )
     assert missing.status_code == 404
     assert missing.json() == {"detail": "任务不存在"}
+
+
+def test_replay_dlq_revives_canceled_workflow_descendants(
+    client: TestClient,
+    db_session: AsyncSession,
+    redis_client: Redis,
+    monkeypatch,
+) -> None:
+    """DLQ 重放必须复活此前被级联取消的下游，否则整张 DAG 卡死。
+
+    A -> B -> C：A 首次执行即 DLQ（MAX_RETRIES=1）→ B/C 被级联取消；
+    重放 A 后 B/C 回到 WAITING；A 成功逐级唤醒，最终整条链 SUCCESS。
+    """
+    assert client.portal is not None
+    _enable_admin(monkeypatch)
+    monkeypatch.setattr(settings, "WORKER_MAX_RETRIES", 1)
+
+    api_key = "vxk_admin_replay_wf_0123456789ab"
+    client.portal.call(create_tenant, db_session, api_key)
+
+    wf = client.post(
+        "/api/v1/workflows",
+        headers={"X-API-Key": api_key},
+        json={
+            "nodes": [
+                {"node_id": "A", "task_type": "demo.fail", "payload": {}},
+                {
+                    "node_id": "B",
+                    "task_type": "demo.echo",
+                    "payload": {},
+                    "depends_on": ["A"],
+                },
+                {
+                    "node_id": "C",
+                    "task_type": "demo.echo",
+                    "payload": {},
+                    "depends_on": ["B"],
+                },
+            ]
+        },
+    )
+    assert wf.status_code == 201
+    nodes = {item["node_id"]: item for item in wf.json()["tasks"]}
+    a_id = UUID(nodes["A"]["task_id"])
+    b_id = UUID(nodes["B"]["task_id"])
+    c_id = UUID(nodes["C"]["task_id"])
+
+    # A 执行一次即 DLQ → B、C 被级联取消
+    tenant_row = client.portal.call(fetch_task, db_session, a_id)
+    stream_key = client.portal.call(tenant_stream_key, tenant_row.tenant_id)
+    a_message_id, a_fields = client.portal.call(
+        read_new_message, redis_client, stream_key
+    )
+    assert a_fields["task_id"] == str(a_id)
+    client.portal.call(process_message, a_message_id, a_fields, stream_key)
+
+    a_record = client.portal.call(fetch_task, db_session, a_id)
+    b_record = client.portal.call(fetch_task, db_session, b_id)
+    c_record = client.portal.call(fetch_task, db_session, c_id)
+    assert a_record.status == TaskStatus.DLQ
+    assert b_record.status == TaskStatus.CANCELED
+    assert c_record.status == TaskStatus.CANCELED
+
+    # 重放 A：自身回 PENDING，B/C 复活为 WAITING
+    replay = client.post(
+        f"/api/v1/admin/tasks/{a_id}/replay", headers=_admin_headers()
+    )
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "PENDING"
+    b_record = client.portal.call(fetch_task, db_session, b_id)
+    c_record = client.portal.call(fetch_task, db_session, c_id)
+    assert b_record.status == TaskStatus.WAITING, "重放必须复活被级联取消的下游"
+    assert c_record.status == TaskStatus.WAITING
+
+    # 端到端：重放后 A 成功 → 唤醒 B → 唤醒 C，全链最终 SUCCESS
+    async def _succeed(payload: dict) -> dict:
+        return {"output": "replayed-ok"}
+
+    register_handler(monkeypatch, "demo.fail", _succeed)
+
+    # XREADGROUP '>' 只返回新消息：已 XACK 的旧 A 消息不会被重复消费
+    replay_message_id, replay_fields = client.portal.call(
+        read_new_message, redis_client, stream_key
+    )
+    assert replay_fields["task_id"] == str(a_id)
+    client.portal.call(process_message, replay_message_id, replay_fields, stream_key)
+
+    # A SUCCESS 后 B 被唤醒为 PENDING 并投递
+    b_record = client.portal.call(fetch_task, db_session, b_id)
+    assert b_record.status == TaskStatus.PENDING
+    b_message_id, b_fields = client.portal.call(
+        read_new_message, redis_client, stream_key
+    )
+    assert b_fields["task_id"] == str(b_id)
+    client.portal.call(process_message, b_message_id, b_fields, stream_key)
+
+    # B SUCCESS 后 C 被唤醒并跑完
+    c_record = client.portal.call(fetch_task, db_session, c_id)
+    assert c_record.status == TaskStatus.PENDING
+    c_message_id, c_fields = client.portal.call(
+        read_new_message, redis_client, stream_key
+    )
+    assert c_fields["task_id"] == str(c_id)
+    client.portal.call(process_message, c_message_id, c_fields, stream_key)
+
+    for task_id in (a_id, b_id, c_id):
+        record = client.portal.call(fetch_task, db_session, task_id)
+        assert record.status == TaskStatus.SUCCESS, f"{task_id} 应为 SUCCESS"
 
 
 def test_cancel_cascades_to_workflow_descendants_and_rejects_terminal(

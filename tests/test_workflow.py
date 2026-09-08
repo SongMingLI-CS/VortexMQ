@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.enums import TaskStatus
-from app.core.payload import VORTEX_SYS_KEY, VORTEX_UPSTREAM_RESULTS_KEY
+from app.core.payload import (
+    MAX_XCOM_INJECT_BYTES,
+    VORTEX_SYS_KEY,
+    VORTEX_UPSTREAM_RESULTS_KEY,
+    payload_size_bytes,
+)
 from app.core.redis import tenant_stream_key
 from tests.helpers import (
     create_tenant,
@@ -25,6 +30,7 @@ from tests.helpers import (
     fetch_task,
     locate_immediate_message,
     process_message,
+    read_new_message,
     rearm_into_past,
 )
 
@@ -210,3 +216,58 @@ def test_upstream_dlq_cascades_cancel_to_waiting_child(
     assert a_record.status == TaskStatus.DLQ
     assert "demo.fail" in (a_record.error_msg or "")
     assert b_record.status == TaskStatus.CANCELED, "上游 DLQ 后下游必须级联取消"
+
+
+def test_xcom_injection_is_bounded_per_child(
+    client: TestClient,
+    db_session: AsyncSession,
+    redis_client: Redis,
+) -> None:
+    """扇入注入超过 XCom 预算时，超出的上游结果被丢弃，下游仍能正常唤醒。
+
+    两个父节点各自返回约 200KB result_data，合并超过 256KiB 预算；
+    子节点照常 WAITING -> PENDING，但 _vortex_sys.upstream_results 只保留
+    预算内的上游，JSONB 行不会无界膨胀。
+    """
+    assert client.portal is not None
+    tenant_id = client.portal.call(create_tenant, db_session, KEY)
+
+    big = "x" * 200_000
+    status, body = _post_workflow(
+        client,
+        KEY,
+        [
+            _node("P1", "demo.echo", payload={"big": big}),
+            _node("P2", "demo.echo", payload={"big": big}),
+            _node("C", "demo.echo", depends_on=["P1", "P2"]),
+        ],
+    )
+    assert status == 201
+    nodes = _task_map(body)
+    p1_id = UUID(nodes["P1"]["task_id"])
+    p2_id = UUID(nodes["P2"]["task_id"])
+    c_id = UUID(nodes["C"]["task_id"])
+    assert nodes["C"]["status"] == "WAITING"
+
+    # 普通车道（high=False 即默认）；任务大厅 XADD 顺序与节点提交顺序一致
+    stream_key = client.portal.call(tenant_stream_key, tenant_id)
+
+    # 依次消费两个父节点（XADD 顺序与节点提交顺序一致）
+    for parent_id in (p1_id, p2_id):
+        message_id, fields = client.portal.call(
+            read_new_message, redis_client, stream_key
+        )
+        assert fields["task_id"] == str(parent_id)
+        client.portal.call(process_message, message_id, fields, stream_key)
+        record = client.portal.call(fetch_task, db_session, parent_id)
+        assert record.status == TaskStatus.SUCCESS
+
+    # 两个父节点都成功，C 应被唤醒为 PENDING
+    c_record = client.portal.call(fetch_task, db_session, c_id)
+    assert c_record.status == TaskStatus.PENDING
+    injected = c_record.payload[VORTEX_SYS_KEY][VORTEX_UPSTREAM_RESULTS_KEY]
+    assert isinstance(injected, dict)
+    assert (
+        len(injected) == 1
+    ), "两路约 200KB 上游超出 256KiB 预算，应丢弃超出的那一路"
+    assert payload_size_bytes(injected) <= MAX_XCOM_INJECT_BYTES

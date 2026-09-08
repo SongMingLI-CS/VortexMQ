@@ -264,3 +264,36 @@ scripts/          asyncio + aiohttp stress client
 ```
 
 API process: HTTP + Sweeper + Dispatcher. Worker process: `python -m app.worker`. Do not colocate them if you want the data plane to scale on its own.
+
+---
+
+## Known Limits & Trade-offs
+
+Deliberate ceilings are marked with `ponytail:` comments in the code:
+
+- **Size boundaries**: global HTTP body cap `2 MiB` (`app/core/body_limit.py`,
+  works for chunked bodies too), per-task `payload` cap `256 KiB`, handler
+  `result_data` cap `1 MiB` (oversize fails the task into retry/DLQ explicitly,
+  never silently truncated), per-child XCom injection budget `256 KiB` (excess
+  upstream results are dropped with a warning log).
+- **Worker concurrency & connections**: in-flight cap per process is
+  `WORKER_MAX_IN_FLIGHT` (default 4). Idle `XREADGROUP BLOCK` holds one Redis
+  connection per tenant — raise `max_connections` in `app/core/redis.py` when
+  the tenant count approaches the pool size.
+- **Cancel semantics**: cancelling a `RUNNING` task does not interrupt the running
+  handler — external side effects cannot be rolled back and its result is not
+  stored. Cancelling `PENDING / WAITING` is safe. `DLQ replay` also revives the
+  cascaded-cancelled WAITING descendants; `CANCELED` tasks themselves are not
+  replayable (only DLQ is exposed on the admin surface).
+- **Retention**: `task_records` has no automatic archive/TTL; the admin task hall
+  uses offset pagination (mitigated by a new `(status, created_at)` index). Plan an
+  archive job for large production datasets.
+- **Tenant lifecycle**: only `create-tenant` / `--rotate` exist; decommissioning a
+  tenant requires manually cleaning its Redis lanes, delayed ZSet and the
+  `{vortex}:tenants` index (PostgreSQL cascades on FK).
+- **Observability**: `vortexmq_tasks_total` is labelled by `tenant_id + task_type`;
+  the Prometheus series grow linearly with tenant count. The admin console stores
+  the `X-Admin-Key` in `localStorage` (prefer HTTPS + CSP, or an httpOnly cookie
+  session).
+- **Status enum**: `FAILED` currently has no writer (failures go to PENDING retry
+  or DLQ) and is kept for backward compatibility with historical rows.

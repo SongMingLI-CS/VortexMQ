@@ -26,6 +26,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.enums import TaskStatus
 from app.core.metrics import observe_task_outcome, track_task_duration
+from app.core.payload import ensure_result_data_within_limit
 from app.core.redis import get_redis, schedule_wakeup, zadd_delayed
 from app.crud.task import (
     MAX_ERROR_MSG_LEN,
@@ -219,6 +220,8 @@ async def handle_message(message_id: str, fields: dict[str, str], *, stream_key:
         async with track_task_duration():
             # 长任务执行期间持续刷新租约，避免被 Outbox / 二次 CAS 重复执行（B2）
             result_data = await _run_with_lease_heartbeat(task_id, handler(payload))
+        # 返回值体积闸门：超限抛错进失败/DLQ 管道，不静默截断，也不允许 JSONB 无界膨胀
+        ensure_result_data_within_limit(result_data)
     except Exception:
         stack = traceback.format_exc()
         logger.exception(

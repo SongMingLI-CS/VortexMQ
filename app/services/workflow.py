@@ -18,7 +18,12 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.clock import as_utc, utcnow
 from app.core.enums import TaskStatus
-from app.core.payload import VORTEX_SYS_KEY, VORTEX_UPSTREAM_RESULTS_KEY
+from app.core.payload import (
+    MAX_XCOM_INJECT_BYTES,
+    VORTEX_SYS_KEY,
+    VORTEX_UPSTREAM_RESULTS_KEY,
+    payload_size_bytes,
+)
 from app.core.redis import schedule_wakeup
 from app.crud.task import get_task_for_update, get_upstream_snapshots, parse_uuid_list
 from app.models.task import TaskRecord
@@ -227,10 +232,21 @@ async def awaken_downstream(session: AsyncSession, finished: TaskRecord) -> list
 
         # 写入系统保留命名空间，避免覆盖用户同名业务字段。
         # 下游读取 payload["_vortex_sys"]["upstream_results"][parent_task_id]。
-        upstream_results = {
-            str(uid): (snapshots[uid][1] if uid in snapshots else None)
-            for uid in upstream_ids
-        }
+        # 按预算注入：结果字典序列化体积不超过 MAX_XCOM_INJECT_BYTES，超出部分
+        # 丢弃并告警（确定性顺序：UUID 升序），防止大扇入节点把下游 JSONB 撑爆。
+        upstream_results: dict[str, Any] = {}
+        for uid in sorted(upstream_ids, key=str):
+            candidate = dict(upstream_results)
+            candidate[str(uid)] = snapshots[uid][1] if uid in snapshots else None
+            if payload_size_bytes(candidate) > MAX_XCOM_INJECT_BYTES:
+                logger.warning(
+                    "XCom 注入超预算，丢弃该上游结果: child=%s parent=%s budget=%s",
+                    child.task_id,
+                    uid,
+                    MAX_XCOM_INJECT_BYTES,
+                )
+                continue
+            upstream_results = candidate
         merged_payload = dict(child.payload or {})
         sys_ns = merged_payload.get(VORTEX_SYS_KEY)
         if not isinstance(sys_ns, dict):
@@ -302,3 +318,57 @@ async def cancel_descendants(session: AsyncSession, failed: TaskRecord) -> int:
             )
 
     return canceled
+
+
+async def revive_canceled_descendants(session: AsyncSession, ancestor: TaskRecord) -> int:
+    """
+    DLQ 重放时把此前被级联取消的下游复活为 WAITING。
+
+    cancel_descendants 的反向操作：从 ancestor 出发 BFS 全部下游，
+    将仍为 CANCELED 的节点改回 WAITING。WAITING 是安全的中性状态——
+    节点会一直等待全部上游（包括本重放节点）SUCCESS 后才被 awaken_downstream
+    真正推入 PENDING，不会绕过依赖提前执行。
+
+    与 cancel_descendants 共用同一锁序（UUID 升序），避免 AB-BA 死锁。
+    只改状态，不清 retry_count / error_msg；不触及非 CANCELED 的节点
+    （PENDING / RUNNING / SUCCESS 的下游保持原状）。
+    """
+    frontier = deque(parse_uuid_list(ancestor.downstream_ids))
+    visited: set[UUID] = set()
+
+    while frontier:
+        current_id = frontier.popleft()
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+
+        row = (
+            await session.execute(
+                select(TaskRecord.task_id, TaskRecord.tenant_id, TaskRecord.downstream_ids).where(
+                    TaskRecord.task_id == current_id
+                )
+            )
+        ).one_or_none()
+        if row is None or row.tenant_id != ancestor.tenant_id:
+            continue
+        frontier.extend(
+            item for item in parse_uuid_list(row.downstream_ids) if item not in visited
+        )
+
+    revived = 0
+    for current_id in sorted(visited, key=str):
+        child = await get_task_for_update(session, current_id)
+        if child is None or child.tenant_id != ancestor.tenant_id:
+            continue
+
+        if child.status == TaskStatus.CANCELED:
+            child.status = TaskStatus.WAITING
+            child.updated_at = utcnow()
+            revived += 1
+            logger.info(
+                "DLQ 重放，复活被级联取消的下游: child=%s ancestor=%s",
+                child.task_id,
+                ancestor.task_id,
+            )
+
+    return revived

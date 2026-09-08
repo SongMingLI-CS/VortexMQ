@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.clock import utcnow
 from app.core.config import settings
 from app.core.enums import TaskStatus
+from app.core.payload import MAX_RESULT_DATA_BYTES
 from app.core.redis import tenant_delayed_key, tenant_stream_key
 from app.worker import handlers  # noqa: F401,E402  # 注册内置 demo.*
 from tests.helpers import (
@@ -28,6 +29,7 @@ from tests.helpers import (
     post_task,
     process_message,
     rearm_into_past,
+    register_handler,
 )
 
 KEY = "vxk_retry_key_0123456789abcdefghij"
@@ -168,3 +170,38 @@ def test_unregistered_task_type_is_taken_over_by_retry_dlq(
 
     record = client.portal.call(fetch_task, db_session, task_id)
     assert "ghost.task" in (record.error_msg or ""), "堆栈应指明缺失的任务类型"
+
+
+def test_oversized_result_data_fails_into_dlq(
+    client: TestClient,
+    db_session: AsyncSession,
+    redis_client: Redis,
+    monkeypatch,
+) -> None:
+    """Handler 返回值超过上限：按任务失败进入 DLQ，不静默截断、不让 JSONB 无界膨胀。"""
+    assert client.portal is not None
+    monkeypatch.setattr(settings, "WORKER_MAX_RETRIES", 1)
+
+    tenant_id = client.portal.call(create_tenant, db_session, KEY)
+    task_type = "size.huge.result"
+    status, body = post_task(client, KEY, task_type=task_type)
+    assert status == 201
+    task_id = UUID(body["task_id"])
+
+    async def _huge(payload: dict) -> dict:
+        # 超过 1MiB 上限；加少量余量覆盖 JSON 转义与键名开销
+        return {"blob": "x" * (MAX_RESULT_DATA_BYTES + 256)}
+
+    register_handler(monkeypatch, task_type, _huge)
+
+    message_id, fields = client.portal.call(
+        locate_immediate_message, redis_client, task_id, tenant_id
+    )
+    stream_key = client.portal.call(tenant_stream_key, tenant_id)
+    client.portal.call(process_message, message_id, fields, stream_key)
+
+    record = client.portal.call(fetch_task, db_session, task_id)
+    assert record.status == TaskStatus.DLQ
+    assert "result_data" in (record.error_msg or ""), "error_msg 应说明体积超限"
+    assert "超过上限" in (record.error_msg or "")
+    assert record.result_data is None, "超限结果不得落库"

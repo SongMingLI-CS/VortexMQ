@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.v1.router import api_router
+from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.config import settings
 from app.core.database import engine, init_db
 from app.core.leader import is_control_leader
@@ -48,6 +49,9 @@ app = FastAPI(
 
 # 所有业务接口统一挂在 /api/v1 下，方便以后做版本演进
 app.include_router(api_router, prefix="/api/v1")
+
+# 全局请求体体积上限（不依赖 Content-Length，chunked 同样拦截）
+app.add_middleware(BodySizeLimitMiddleware)
 
 
 @app.exception_handler(RequestValidationError)

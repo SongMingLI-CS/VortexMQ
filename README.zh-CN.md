@@ -263,3 +263,30 @@ scripts/          asyncio + aiohttp 压测客户端
 ```
 
 API 进程：HTTP + Sweeper + Dispatcher。Worker 进程：`python -m app.worker`。数据面要单独扩容时，不要和 API 绑在同一个进程里。
+
+---
+
+## 已知限制与设计边界（Known Limits & Trade-offs）
+
+以下限制是刻意的取舍，代码内均有 `ponytail:` 注释标注：
+
+- **体积边界**：HTTP 全局请求体上限 `2 MiB`（`app/core/body_limit.py`，不依赖
+  Content-Length，chunked 同样拦截）；单任务 payload `256 KiB`；Handler 返回值
+  `result_data` 上限 `1 MiB`（超限按任务失败显式进入重试/DLQ，不静默截断）；
+  单节点 XCom 注入预算 `256 KiB`（超出丢弃该上游结果并打告警日志）。
+- **Worker 并发与连接**：单进程在途上限 `WORKER_MAX_IN_FLIGHT`（默认 4）；
+  全空空闲期用 `XREADGROUP BLOCK` 每租户暂占一条 Redis 连接，租户数接近
+  连接池上限时请调大 `app/core/redis.py` 的 `max_connections`。
+- **取消语义**：`取消 RUNNING` 不会中断正在执行的 Handler——外部副作用无法回收，
+  任务终态为 CANCELED 但结果不落库。对 `PENDING / WAITING` 取消是安全的。
+  `DLQ 重放`会一并复活此前被级联取消的 WAITING 下游；已被取消（CANCELED）
+  的任务本身不可重放（管理面只开放 DLQ 重放）。
+- **数据保留**：`task_records` 无自动归档 / TTL；Admin 任务大厅为 offset 分页，
+  已补 `(status, created_at)` 索引缓解深翻页。生产大数据量建议另做归档任务。
+- **租户生命周期**：仅提供 `create-tenant` / `--rotate`；下线租户需手动清理其
+  Redis 车道、延迟 ZSet 与 `{vortex}:tenants` 索引（PostgreSQL 侧按外键级联）。
+- **可观测性**：`vortexmq_tasks_total` 按 `tenant_id + task_type` 打点，租户规模
+  增大时 Prometheus 序列会线性增长；管理控制台 Admin Key 保存在浏览器
+  `localStorage`（建议 HTTPS + CSP，或改为 httpOnly Cookie 会话）。
+- **状态枚举**：`FAILED` 目前没有写入方（失败一律走 PENDING 重试或 DLQ），保留
+  仅为兼容历史行与查询面语义。

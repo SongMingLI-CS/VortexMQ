@@ -38,6 +38,8 @@ class TaskRecord(Base):
         ),
         # Outbox Sweeper：按状态 + 更新时间捞取过期 PENDING
         Index("ix_task_records_status_updated_at", "status", "updated_at"),
+        # Admin 任务大厅：跨租户按状态过滤 + created_at 倒序排序
+        Index("ix_task_records_status_created_at", "status", "created_at"),
         Index("ix_task_records_workflow_id", "workflow_id"),
     )
 
