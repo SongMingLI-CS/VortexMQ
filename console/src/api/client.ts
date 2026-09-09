@@ -56,10 +56,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  listTasks(params: { status?: string; page?: number; page_size?: number } = {}) {
+  listTasks(params: { status?: string; cursor?: string; page_size?: number } = {}) {
     const q = new URLSearchParams()
     if (params.status) q.set('status', params.status)
-    q.set('page', String(params.page ?? 1))
+    if (params.cursor) q.set('cursor', params.cursor)
     q.set('page_size', String(params.page_size ?? 20))
     return request<AdminTaskListResponse>(`/api/v1/admin/tasks?${q.toString()}`)
   },

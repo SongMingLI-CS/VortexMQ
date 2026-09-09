@@ -115,7 +115,12 @@ def test_admin_requires_configured_key_and_rejects_invalid(
 
     ok = client.get("/api/v1/admin/tasks", headers=_admin_headers())
     assert ok.status_code == 200
-    assert ok.json() == {"items": [], "total": 0, "page": 1, "page_size": 20}
+    assert ok.json() == {
+        "items": [],
+        "total": 0,
+        "page_size": 20,
+        "next_cursor": None,
+    }
 
 
 def test_task_hall_filters_and_pagination(
@@ -148,7 +153,8 @@ def test_task_hall_filters_and_pagination(
     # 默认：全量 4 条，最新创建在前
     all_body = client.get("/api/v1/admin/tasks", headers=_admin_headers()).json()
     assert all_body["total"] == 4
-    assert all_body["page"] == 1
+    assert all_body["page_size"] == 20
+    assert all_body["next_cursor"] is None, "一页已取完所有数据，不应再有下一页"
     assert [item["tenant_name"] for item in all_body["items"]] == [
         "hall-beta",
         "hall-alpha",
@@ -191,19 +197,51 @@ def test_task_hall_filters_and_pagination(
     assert ranged["items"][0]["retry_count"] == 0
 
     # 分页：page_size=2 时第一页返回 t4/t3，第二页返回 t2/t1
+    # keyset 翻页：page_size=2 首页返回最新两条（beta noop、alpha echo）
     page1 = client.get(
-        "/api/v1/admin/tasks", headers=_admin_headers(), params={"page": 1, "page_size": 2}
-    ).json()
-    page2 = client.get(
-        "/api/v1/admin/tasks", headers=_admin_headers(), params={"page": 2, "page_size": 2}
+        "/api/v1/admin/tasks",
+        headers=_admin_headers(),
+        params={"page_size": 2},
     ).json()
     assert page1["total"] == 4
+    assert page1["page_size"] == 2
     assert len(page1["items"]) == 2
     assert [item["task_type"] for item in page1["items"]] == ["demo.noop", "demo.echo"]
+    next_cursor = page1["next_cursor"]
+    assert isinstance(next_cursor, str) and next_cursor
+
+    # 翻页之间插入一条更新的任务：新行只会出现在更靠前的页；
+    # 已签发的游标仍按 (created_at, task_id) 锚点续页——不重、不漏。
+    client.portal.call(
+        _insert_task,
+        db_session,
+        alpha_id,
+        TaskStatus.PENDING,
+        "demo.new",
+        0,
+        None,
+        _HALL_BASE + 4 * day,
+    )
+
+    page2 = client.get(
+        "/api/v1/admin/tasks",
+        headers=_admin_headers(),
+        params={"page_size": 2, "cursor": next_cursor},
+    ).json()
     assert [item["task_type"] for item in page2["items"]] == ["demo.noop", "demo.fail"]
     assert page2["items"][1]["tenant_name"] == "hall-alpha"
     assert page2["items"][1]["status"] == "DLQ"
     assert page2["items"][1]["error_msg"] == "boom"
+    assert page2["next_cursor"] is None, "已是末页：next_cursor 应为 null"
+
+    # 篡改 / 无效游标统一 422，不落到 SQL 层
+    bad = client.get(
+        "/api/v1/admin/tasks",
+        headers=_admin_headers(),
+        params={"page_size": 2, "cursor": "AAAA"},
+    )
+    assert bad.status_code == 422
+    assert bad.json() == {"detail": "无效的分页游标"}
 
 
 def test_replay_dlq_back_to_pending_and_rerun_to_success(

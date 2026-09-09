@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import as_utc
@@ -43,18 +43,44 @@ def _build_conditions(
     return conditions
 
 
+def _keyset_conditions(
+    *,
+    cursor_created_at: datetime | None,
+    cursor_task_id: UUID | None,
+) -> list:
+    """游标谓词：接上一页末行 (created_at, task_id) 之后的记录。
+
+    排序为 created_at DESC, task_id ASC（见 ORDER BY），因此「下一页」是
+    时间更旧的行，或时间相同但 task_id 更大的行。游标使每页翻页代价与
+    页码无关——不再 OFFSET 跳过已读行。
+    """
+    if cursor_created_at is None or cursor_task_id is None:
+        return []
+    created_at = as_utc(cursor_created_at)
+    return [
+        or_(
+            TaskRecord.created_at < created_at,
+            and_(
+                TaskRecord.created_at == created_at,
+                TaskRecord.task_id > cursor_task_id,
+            ),
+        )
+    ]
+
+
 async def list_admin_tasks(
     session: AsyncSession,
     *,
     limit: int,
-    offset: int,
+    cursor_created_at: datetime | None = None,
+    cursor_task_id: UUID | None = None,
     status: TaskStatus | None = None,
     tenant_name: str | None = None,
     tenant_id: UUID | None = None,
     created_from: datetime | None = None,
     created_to: datetime | None = None,
 ) -> list[tuple[TaskRecord, str]]:
-    """任务大厅分页列表：最新创建在前，返回 (record, tenant_name) 二元组。"""
+    """任务大厅 keyset 分页列表：最新创建在前，返回 (record, tenant_name) 二元组。"""
     conditions = _build_conditions(
         status=status,
         tenant_name=tenant_name,
@@ -62,12 +88,15 @@ async def list_admin_tasks(
         created_from=created_from,
         created_to=created_to,
     )
+    conditions += _keyset_conditions(
+        cursor_created_at=cursor_created_at,
+        cursor_task_id=cursor_task_id,
+    )
     stmt = (
         select(TaskRecord, Tenant.name)
         .join(Tenant, Tenant.id == TaskRecord.tenant_id)
         .where(*conditions)
-        .order_by(TaskRecord.created_at.desc(), TaskRecord.task_id)
-        .offset(offset)
+        .order_by(TaskRecord.created_at.desc(), TaskRecord.task_id.asc())
         .limit(limit)
     )
     rows = (await session.execute(stmt)).all()

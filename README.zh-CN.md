@@ -218,9 +218,11 @@ task_ids = client.submit_workflow(wf)  # -> ["<a-task-id>", "<b-task-id>"]
 `X-Admin-Key`，不经过租户鉴权，需先在 `.env` 设置 `ADMIN_API_KEY`：
 
 ```bash
-# 任务大厅：跨租户筛选 + 分页（status / tenant_name / tenant_id / created_from / created_to）
-curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page=1&page_size=20" \
+# 任务大厅：keyset 游标分页（status / tenant_name / tenant_id / created_from / created_to）
+curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page_size=20" \
   -H "X-Admin-Key: <your-admin-key>"
+#   -> {"items": [...], "total": N, "page_size": 20, "next_cursor": "..."}
+# 下一页：把 next_cursor 作为 ?cursor=... 传回；next_cursor 为 null 即到底。
 
 # DLQ 重放：捞回 PENDING 并重新叫醒 Worker
 curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/replay \
@@ -281,8 +283,11 @@ API 进程：HTTP + Sweeper + Dispatcher。Worker 进程：`python -m app.worker
   任务终态为 CANCELED 但结果不落库。对 `PENDING / WAITING` 取消是安全的。
   `DLQ 重放`会一并复活此前被级联取消的 WAITING 下游；已被取消（CANCELED）
   的任务本身不可重放（管理面只开放 DLQ 重放）。
-- **数据保留**：`task_records` 无自动归档 / TTL；Admin 任务大厅为 offset 分页，
-  已补 `(status, created_at)` 索引缓解深翻页。生产大数据量建议另做归档任务。
+- **数据保留**：`task_records` 无自动归档 / TTL。Admin 任务大厅使用对客户端
+  不透明的 keyset 游标按 `(created_at DESC, task_id ASC)` 翻页，翻页代价与深度
+  无关（`(status, created_at)` 索引服务状态筛选视图，`(created_at DESC,
+  task_id ASC)` 服务无筛选默认视图）；`total` 统计每次仍会扫描匹配行，生产
+  大数据量建议另做归档任务。
 - **租户生命周期**：仅提供 `create-tenant` / `--rotate`；下线租户需手动清理其
   Redis 车道、延迟 ZSet 与 `{vortex}:tenants` 索引（PostgreSQL 侧按外键级联）。
 - **可观测性**：`vortexmq_tasks_total` 按 `tenant_id + task_type` 打点，租户规模

@@ -7,6 +7,8 @@ Admin 管理面 API：任务大厅 / DLQ 重放 / 强制取消 / Worker 节点�
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime
 from uuid import UUID
 
@@ -14,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_admin
+from app.core.clock import as_utc
 from app.core.database import get_db
 from app.core.enums import TaskStatus
 from app.core.redis import list_worker_heartbeats
@@ -41,6 +44,30 @@ from app.services.admin import (
 router = APIRouter(dependencies=[Depends(get_admin)])
 
 
+def _encode_page_cursor(created_at: datetime, task_id: UUID) -> str:
+    """把末行锚点 (created_at, task_id) 编码成对客户端不透明的翻页游标。"""
+    raw = json.dumps(
+        {"c": created_at.isoformat(), "t": str(task_id)}, separators=(",", ":")
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_page_cursor(cursor: str) -> tuple[datetime, UUID]:
+    """解析游标；任何格式问题统一视为无效游标（422）。"""
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        )
+        created_at = as_utc(datetime.fromisoformat(payload["c"]))
+        task_id = UUID(payload["t"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="无效的分页游标",
+        ) from exc
+    return created_at, task_id
+
+
 def _to_item(record: TaskRecord, tenant_name: str) -> AdminTaskItem:
     """把 (ORM 任务, 租户名) 组装成大厅展示模型。"""
     return AdminTaskItem(
@@ -62,8 +89,9 @@ def _to_item(record: TaskRecord, tenant_name: str) -> AdminTaskItem:
 @router.get(
     "/tasks",
     response_model=AdminTaskListResponse,
-    summary="任务大厅：跨租户分页列表",
-    description="按状态 / 租户名 / 租户 ID / 创建时间范围筛选，最新创建在前。",
+    summary="任务大厅：跨租户游标分页列表",
+    description="按状态 / 租户名 / 租户 ID / 创建时间范围筛选，最新创建在前。"
+    "翻下一页携带上一页返回的 next_cursor，服务端做 keyset 定位，翻页代价与页码无关。",
 )
 async def list_tasks(
     status_filter: TaskStatus | None = Query(
@@ -79,12 +107,19 @@ async def list_tasks(
     created_to: datetime | None = Query(
         default=None, description="创建时间上限（含），ISO 8601"
     ),
-    page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(
         default=20, ge=1, le=100, description="每页条数，上限 100"
     ),
+    cursor: str | None = Query(
+        default=None, description="上一页返回的 next_cursor，用于获取下一页"
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> AdminTaskListResponse:
+    cursor_created_at = None
+    cursor_task_id = None
+    if cursor is not None:
+        cursor_created_at, cursor_task_id = _decode_page_cursor(cursor)
+
     total = await count_admin_tasks(
         db,
         status=status_filter,
@@ -93,22 +128,31 @@ async def list_tasks(
         created_from=created_from,
         created_to=created_to,
     )
-    offset = (page - 1) * page_size
+    # 多取一行探测是否还有下一页，避免客户端为「到底了」多发一次空请求
     rows = await list_admin_tasks(
         db,
-        limit=page_size,
-        offset=offset,
+        limit=page_size + 1,
+        cursor_created_at=cursor_created_at,
+        cursor_task_id=cursor_task_id,
         status=status_filter,
         tenant_name=tenant_name,
         tenant_id=tenant_id,
         created_from=created_from,
         created_to=created_to,
     )
+    has_more = len(rows) > page_size
+    page_rows = rows[:page_size]
+
+    next_cursor: str | None = None
+    if has_more and page_rows:
+        last_record, _ = page_rows[-1]
+        next_cursor = _encode_page_cursor(last_record.created_at, last_record.task_id)
+
     return AdminTaskListResponse(
-        items=[_to_item(record, name) for record, name in rows],
+        items=[_to_item(record, name) for record, name in page_rows],
         total=total,
-        page=page,
         page_size=page_size,
+        next_cursor=next_cursor,
     )
 
 

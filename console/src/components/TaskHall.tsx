@@ -24,7 +24,9 @@ function shortId(id: string): string {
 
 export function TaskHall() {
   const [status, setStatus] = useState<string>('')
-  const [page, setPage] = useState(1)
+  // history[i] = 第 i+2 页实际使用的翻页游标；当前页 = history.length + 1
+  const [history, setHistory] = useState<string[]>([])
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
   const pageSize = 20
   const [data, setData] = useState<{ items: AdminTaskItem[]; total: number } | null>(
     null,
@@ -34,27 +36,54 @@ export function TaskHall() {
   const [workflowId, setWorkflowId] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await api.listTasks({
-        status: status || undefined,
-        page,
-        page_size: pageSize,
-      })
-      setData(res)
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [status, page])
+  const loadPage = useCallback(
+    async (cursor: string | undefined, stack: string[]) => {
+      setLoading(true)
+      setError(null)
+      try {
+        const res = await api.listTasks({
+          status: status || undefined,
+          cursor,
+          page_size: pageSize,
+        })
+        setData(res)
+        setHistory(stack)
+        setNextCursor(res.next_cursor)
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [status],
+  )
+
+  const loadFirst = useCallback(() => loadPage(undefined, []), [loadPage])
 
   useEffect(() => {
-    load()
-  }, [load])
+    void loadFirst()
+  }, [loadFirst])
 
+  // 刷新当前页：用本页（stack 末尾）的游标原地重取，操作后状态即时可见
+  const refresh = useCallback(() => {
+    const cursor = history.length ? history[history.length - 1] : undefined
+    return loadPage(cursor, history)
+  }, [history, loadPage])
+
+  const goNext = useCallback(() => {
+    if (!nextCursor) return
+    const stack = [...history, nextCursor]
+    void loadPage(nextCursor, stack)
+  }, [history, nextCursor, loadPage])
+
+  const goPrev = useCallback(() => {
+    if (history.length === 0) return
+    const stack = history.slice(0, -1)
+    const cursor = stack.length ? stack[stack.length - 1] : undefined
+    void loadPage(cursor, stack)
+  }, [history, loadPage])
+
+  const page = history.length + 1
   const totalPages = data ? Math.max(1, Math.ceil(data.total / pageSize)) : 1
 
   async function act(kind: 'replay' | 'cancel', id: string) {
@@ -63,7 +92,7 @@ export function TaskHall() {
     try {
       if (kind === 'replay') await api.replayTask(id)
       else await api.cancelTask(id)
-      await load()
+      await refresh()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err))
     } finally {
@@ -79,8 +108,8 @@ export function TaskHall() {
           <select
             value={status}
             onChange={(e) => {
+              // status 变化会让 loadFirst 重建，effect 自动回到第一页
               setStatus(e.target.value)
-              setPage(1)
             }}
           >
             <option value="">全部</option>
@@ -91,7 +120,7 @@ export function TaskHall() {
             ))}
           </select>
         </label>
-        <button onClick={load} disabled={loading}>
+        <button onClick={() => void refresh()} disabled={loading}>
           刷新
         </button>
         <span className="panel__total">共 {data?.total ?? 0} 条</span>
@@ -165,13 +194,13 @@ export function TaskHall() {
       )}
 
       <div className="pagination">
-        <button disabled={page <= 1} onClick={() => setPage(page - 1)}>
+        <button disabled={history.length === 0} onClick={goPrev}>
           上一页
         </button>
         <span>
           {page} / {totalPages}
         </span>
-        <button disabled={page >= totalPages} onClick={() => setPage(page + 1)}>
+        <button disabled={!nextCursor} onClick={goNext}>
           下一页
         </button>
       </div>

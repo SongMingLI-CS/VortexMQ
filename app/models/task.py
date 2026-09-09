@@ -11,7 +11,17 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -40,6 +50,13 @@ class TaskRecord(Base):
         Index("ix_task_records_status_updated_at", "status", "updated_at"),
         # Admin 任务大厅：跨租户按状态过滤 + created_at 倒序排序
         Index("ix_task_records_status_created_at", "status", "created_at"),
+        # Admin 任务大厅默认视图：无筛选时按 created_at 倒序游标翻页
+        # 显式 DESC + task_id ASC 与 ORDER BY 完全一致，游标翻页每页只扫 page_size 行
+        Index(
+            "ix_task_records_created_at_id",
+            text("created_at DESC"),
+            text("task_id ASC"),
+        ),
         Index("ix_task_records_workflow_id", "workflow_id"),
     )
 

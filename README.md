@@ -219,9 +219,11 @@ separate `X-Admin-Key` header instead of tenant auth. Set `ADMIN_API_KEY` in you
 `.env` first:
 
 ```bash
-# Task hall: cross-tenant filters + pagination (status / tenant_name / tenant_id / created_from / created_to)
-curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page=1&page_size=20" \
+# Task hall: keyset cursor pagination (status / tenant_name / tenant_id / created_from / created_to)
+curl -sS "http://127.0.0.1:8000/api/v1/admin/tasks?status=DLQ&page_size=20" \
   -H "X-Admin-Key: <your-admin-key>"
+#   -> {"items": [...], "total": N, "page_size": 20, "next_cursor": "..."}
+# Next page: pass next_cursor back as ?cursor=...; stop when next_cursor is null.
 
 # Replay a DLQ task: back to PENDING and re-wake the Worker
 curl -sS -X POST http://127.0.0.1:8000/api/v1/admin/tasks/<task_id>/replay \
@@ -285,9 +287,12 @@ Deliberate ceilings are marked with `ponytail:` comments in the code:
   stored. Cancelling `PENDING / WAITING` is safe. `DLQ replay` also revives the
   cascaded-cancelled WAITING descendants; `CANCELED` tasks themselves are not
   replayable (only DLQ is exposed on the admin surface).
-- **Retention**: `task_records` has no automatic archive/TTL; the admin task hall
-  uses offset pagination (mitigated by a new `(status, created_at)` index). Plan an
-  archive job for large production datasets.
+- **Retention**: `task_records` has no automatic archive/TTL. The admin task hall
+  paginates with an opaque keyset cursor over `(created_at DESC, task_id ASC)` —
+  page cost is independent of depth (indexes: `(status, created_at)` for filtered
+  views, `(created_at DESC, task_id ASC)` for the unfiltered default). The
+  `total` count still scans matching rows on every request; plan an archive job
+  for large production datasets.
 - **Tenant lifecycle**: only `create-tenant` / `--rotate` exist; decommissioning a
   tenant requires manually cleaning its Redis lanes, delayed ZSet and the
   `{vortex}:tenants` index (PostgreSQL cascades on FK).

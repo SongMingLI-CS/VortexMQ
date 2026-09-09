@@ -18,6 +18,7 @@ interface TaskNodeData {
   taskType: string
   status: TaskStatus
   taskId: string
+  [key: string]: unknown
 }
 
 type TaskFlowNode = Node<TaskNodeData>

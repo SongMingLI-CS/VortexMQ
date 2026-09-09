@@ -33,12 +33,16 @@ class AdminTaskItem(BaseModel):
 
 
 class AdminTaskListResponse(BaseModel):
-    """分页任务列表。"""
+    """keyset 游标分页的任务列表。
+
+    total 为满足筛选条件的总数（供大厅统计展示）；翻下一页请携带
+    next_cursor，而非页码——游标由服务端签发、对客户端不透明。
+    """
 
     items: list[AdminTaskItem]
     total: int
-    page: int
     page_size: int
+    next_cursor: str | None = None
 
 
 class AdminWorkerInfo(BaseModel):
