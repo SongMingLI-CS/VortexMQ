@@ -5,12 +5,22 @@ x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/vortexmq
   REDIS_URL: redis://redis:6379/0
   DEBUG: "false"
+  # 演示用一键启动：依赖启动期 create_all 兜底建表（AUTO_CREATE_SCHEMA 默认 true）。
+  # 生产部署请先执行 `python -m alembic upgrade head`，并把这里改为 "false"，
+  # 让启动路径完全不执行 DDL。
+  AUTO_CREATE_SCHEMA: "true"
   REDIS_STREAM_KEY: vortex:tasks:stream
   REDIS_DELAYED_KEY: vortex:tasks:delayed
   REDIS_CONSUMER_GROUP: vortex:workers
   WORKER_METRICS_PORT: "8001"
   # 管理面 API Key（仅演示；生产请换随机长串）
   ADMIN_API_KEY: change-me-admin-key
+  # AI Handler：从宿主机 .env 读入。缺凭证且未显式开启 AI_MOCK_ENABLED 时，
+  # ai.deepseek.chat 会显式失败进入重试 / DLQ，而不是返回假数据。
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-https://api.deepseek.com/v1/chat/completions}
+  DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-120}
+  AI_MOCK_ENABLED: ${AI_MOCK_ENABLED:-false}
 
 services:
   postgres:
@@ -63,7 +73,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')",
         ]
       interval: 10s
       timeout: 5s
@@ -83,6 +93,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      api:
+        condition: service_healthy
+
+  console:
+    build:
+      context: ./console
+    container_name: vortexmq-console
+    ports:
+      - "8080:80"
+    depends_on:
       api:
         condition: service_healthy
 

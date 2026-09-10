@@ -10,6 +10,7 @@
 """
 
 from collections.abc import AsyncGenerator
+import logging
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -19,6 +20,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+logger = logging.getLogger("vortexmq.db")
 
 
 class Base(DeclarativeBase):
@@ -60,7 +63,14 @@ async def init_db() -> None:
         旧版建库 -> python -m alembic stamp head 后再升级
     这样 schema 演进走 migrations/versions/ 下的版本化迁移，避免多个副本
     同时执行启动期 DDL 互相竞争（以及 CREATE TYPE ADD VALUE 的事务限制）。
+
+    ``AUTO_CREATE_SCHEMA=false`` 时完全跳过本函数，schema 只能由迁移创建——
+    这是生产多副本部署的推荐配置。
     """
+    if not settings.AUTO_CREATE_SCHEMA:
+        logger.info("AUTO_CREATE_SCHEMA=false，跳过启动期建表：schema 由 Alembic 迁移管理")
+        return
+
     from app.models import TaskRecord, Tenant  # noqa: F401
 
     async with engine.begin() as conn:

@@ -451,6 +451,16 @@ def test_cancel_cascades_to_workflow_descendants_and_rejects_terminal(
     assert a_record.status == TaskStatus.CANCELED
     assert b_record.status == TaskStatus.CANCELED, "取消上游必须级联取消 WAITING 下游"
 
+    # 查询被取消任务的结果：400，且说明必须是「已取消」而不是「执行失败」
+    canceled_result = client.get(
+        f"/api/v1/tasks/{a_id}/result", headers={"X-API-Key": api_key}
+    )
+    assert canceled_result.status_code == 400
+    canceled_body = canceled_result.json()
+    assert canceled_body["status"] == "CANCELED"
+    assert "取消" in canceled_body["error_msg"]
+    assert "执行失败" not in canceled_body["error_msg"]
+
     # 幂等：重复取消仍 200
     again = client.post(
         f"/api/v1/admin/tasks/{a_id}/cancel", headers=_admin_headers()

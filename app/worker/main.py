@@ -28,6 +28,7 @@ from app.core.metrics import (
     increment_worker_in_flight,
     start_metrics_http_server,
 )
+from app.core.observability import configure_logging
 from app.core.redis import (
     close_redis,
     ensure_consumer_group,
@@ -484,10 +485,7 @@ async def run_worker_loop(consumer: str, stop_event: asyncio.Event) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    )
+    configure_logging()
     start_metrics_http_server()
     try:
         asyncio.run(run_worker())

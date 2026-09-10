@@ -19,6 +19,13 @@ router = APIRouter()
 _IN_FLIGHT = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING}
 _FAILED = {TaskStatus.FAILED, TaskStatus.DLQ, TaskStatus.CANCELED}
 
+# 终态但没有 error_msg 时的兜底说明：不能把「已取消」说成「执行失败」。
+_FAILURE_MESSAGES = {
+    TaskStatus.FAILED: "任务执行失败",
+    TaskStatus.DLQ: "任务重试次数耗尽，已进入死信队列（可经管理面重放）",
+    TaskStatus.CANCELED: "任务已被取消，未产出结果",
+}
+
 
 @router.post(
     "",
@@ -85,7 +92,8 @@ async def get_task_result(
             content={
                 "task_id": str(record.task_id),
                 "status": record.status.value,
-                "error_msg": record.error_msg or "任务执行失败",
+                "error_msg": record.error_msg
+                or _FAILURE_MESSAGES.get(record.status, "任务未产出结果"),
             },
         )
 

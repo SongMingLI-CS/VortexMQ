@@ -26,13 +26,34 @@ class Settings(BaseSettings):
     # SQLAlchemy engine echo 独立开关。不要把敏感 payload 通过 SQL 日志泄漏出去。
     SQL_ECHO: bool = False
 
+    # 启动期建表兜底（仅 create_all，不做 ALTER）。默认 true 让本地开发与 docker compose
+    # 免手工迁移即可跑；生产多副本应设为 false，改由部署流水线执行
+    # `python -m alembic upgrade head`，避免启动期 DDL 与版本化迁移漂移。
+    AUTO_CREATE_SCHEMA: bool = True
+
     # 管理面 API 凭证（X-Admin-Key 明文）。为空时 /api/v1/admin/** 全部返回 503，
     # 避免误部署把跨租户管理接口暴露成匿名可调。必须用随机长串覆盖默认值。
     ADMIN_API_KEY: str = ""
 
-    # DeepSeek LLM API 凭证。为空时 ai.deepseek.chat 走 Mock 路径（sleep 1s 后返回
-    # 模拟文本），保证 Showcase / 测试无需外部依赖也能跑通完整 DAG。
+    # 内置演示 Handler（demo.sleep / demo.echo / demo.noop / demo.fail）注册开关。
+    # 本地开发与 CI 需要它们（压测脚本、冒烟用例）；生产建议设为 false，
+    # 否则任何租户都能用 demo.* 占用 Worker 在途槽位。
+    ENABLE_DEMO_HANDLERS: bool = True
+
+    # DeepSeek LLM API 凭证。未配置且未显式打开 AI_MOCK_ENABLED 时，
+    # ai.deepseek.chat 会抛 AIProviderError（交由重试 / DLQ 管道显式暴露），
+    # 绝不会静默返回假数据冒充模型输出。
     DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_API_URL: str = "https://api.deepseek.com/v1/chat/completions"
+    # 单次模型调用超时（秒）。必须小于 Worker 租约回收阈值（WORKER_CLAIM_IDLE_MS/1000），
+    # 否则调用还没返回就可能被 Outbox 判为僵尸任务回收重跑。
+    DEEPSEEK_TIMEOUT_SECONDS: float = 120.0
+    # max_tokens 上限：防止调用方用 payload 把生成预算写到天文数字。
+    AI_MAX_TOKENS_LIMIT: int = 8192
+    # 离线模拟开关（默认 false）。仅当显式为 true 时，缺少 DEEPSEEK_API_KEY 的
+    # ai.deepseek.chat 才返回模拟文本，用于本地演示 / CI 无外部依赖跑通 DAG。
+    # 生产必须保持 false：真实调用失败不允许 fallback 成假数据。
+    AI_MOCK_ENABLED: bool = False
 
     # 例：postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/vortexmq"
@@ -79,8 +100,9 @@ class Settings(BaseSettings):
 
     # Worker 指标 HTTP 端口；Prometheus 在 Docker 网络内抓取 worker:8001/metrics
     WORKER_METRICS_PORT: int = 8001
+    # Worker 心跳有效期（秒）。心跳 ZSet 的实际键由 app/core/redis.py 拼装为
+    # {vortex}:metrics:workers，不通过环境变量配置。
     WORKER_HEARTBEAT_TTL_SECONDS: int = 15
-    REDIS_WORKER_HEARTBEAT_KEY: str = "vortex:metrics:workers"  # 兼容旧 .env；实际键为 {vortex}:metrics:workers
 
     # Stream 近似裁剪上限，防止只 XACK 不删除把 Redis 磁盘写满
     REDIS_STREAM_MAXLEN: int = 100_000

@@ -10,6 +10,10 @@ pydantic-settings>=2.6.0
 sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
 
+# 版本化 schema 迁移（生产部署与 Makefile migrate 目标都需要它，
+# 因此属于运行时依赖，不能只放在 requirements-dev.txt 里）
+alembic>=1.14.0
+
 # Redis Streams（redis.asyncio 位于 redis 包内）
 redis>=5.2.0
 
