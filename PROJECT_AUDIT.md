@@ -178,8 +178,9 @@ VortexMQ **不是** mock 驱动的演示仓库，而是一个真实的异步任�
 | `DEEPSEEK_API_URL` / `DEEPSEEK_TIMEOUT_SECONDS` / `AI_MAX_TOKENS_LIMIT` | 模型调用地址与边界 | Worker | 有默认 | ✅（本轮补齐） |
 | `AI_MOCK_ENABLED` | 离线模拟开关（生产须 false） | Worker | 有默认 | ✅（本轮新增） |
 | `ENABLE_DEMO_HANDLERS` | demo.* Handler 注册开关 | Worker | 有默认 | ✅（本轮新增） |
-| `WORKER_MAX_IN_FLIGHT` / `WORKER_BLOCK_MS` / `WORKER_CLAIM_IDLE_MS` / `WORKER_LEASE_HEARTBEAT_SECONDS` / `WORKER_MAX_RETRIES` / `WORKER_RETRY_BASE_DELAY_SECONDS` / `WORKER_CONSUMER_NAME` / `WORKER_METRICS_PORT` / `WORKER_HEARTBEAT_TTL_SECONDS` | Worker 并发、租约、退避、监控 | Worker | 有默认 | ✅（本轮补齐 8 项） |
+| `WORKER_MAX_IN_FLIGHT` / `WORKER_BLOCK_MS` / `WORKER_CLAIM_IDLE_MS` / `WORKER_LEASE_HEARTBEAT_SECONDS` / `WORKER_MAX_RETRIES` / `WORKER_RETRY_BASE_DELAY_SECONDS` / `WORKER_CONSUMER_NAME` / `WORKER_METRICS_PORT` / `WORKER_HEARTBEAT_TTL_SECONDS` | Worker 并发、租约、退避、监控 | Worker | 有默认 | ✅（本轮补齐 5 项） |
 | `OUTBOX_*` / `DELAY_DISPATCH_*` / `CONTROL_LEADER_*` | 控制面补偿与选主 | API | 有默认 | ✅（本轮补齐 2 项） |
+| `AUTO_CREATE_SCHEMA` | 启动期建表兜底开关 | API / Worker | 有默认 | ✅（本轮新增） |
 | `DEBUG` | 日志级别（DEBUG/INFO） | API / Worker | 有默认 | ✅（本轮起真正生效） |
 | `SQL_ECHO` | SQLAlchemy echo | API / Worker | 有默认 | ✅ |
 
@@ -218,7 +219,9 @@ VortexMQ **不是** mock 驱动的演示仓库，而是一个真实的异步任�
     暂不可解析也能启动），透传 `X-Request-ID`。
 12. `sdk/python/pyproject.toml` + `README.md`：SDK 变为可 `pip install -e sdk/python` 的正式包。
 13. CI：新增 `compileall` 步骤与独立 `console` job（`npm ci` + `tsc && vite build`）。
-14. `.env.example`：补齐 15 个未文档化变量（Worker 租约/并发、Outbox/Dispatcher 批次、AI、demo 开关）。
+14. `.env.example`：补齐 14 个未文档化变量（Worker 租约/并发 5、Outbox/Dispatcher 批次 2、
+    AI 6、`AUTO_CREATE_SCHEMA` 1）；`requirements.txt` 补上此前缺失的 `alembic`
+    （否则 CI 迁移步骤与文档里的生产迁移命令在干净环境无法执行）。
 
 **测试（回归覆盖）**
 15. 新增 8 个 AI Handler 契约测试（显式失败、越界参数、401 映射、响应结构异常、成功透传、离线模拟开关）；
