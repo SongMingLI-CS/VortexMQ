@@ -133,16 +133,25 @@ docker compose up -d --build
 Schema 演进统一走 **Alembic**（`migrations/`）。全新生产数据库先执行
 `python -m alembic upgrade head`；由旧脚手架 `create_all` 建出来的库请先执行
 一次 `python -m alembic stamp head`，此后一律走版本化迁移。应用启动路径只保留
-`create_all` 作为本地脚手架兜底。
+`create_all` 作为本地脚手架兜底——生产（多副本）请设 `AUTO_CREATE_SCHEMA=false`，
+让启动路径完全不执行 DDL，schema 变更只由迁移驱动。
 
 | 端口 | 服务 |
 |------|------|
 | 8000 | API（`/docs`、`/metrics`） |
 | 8001 | Worker 指标 |
+| 8080 | 管理控制台（`console/`，Nginx 静态托管 + 同源 `/api` 反向代理） |
 | 5432 | PostgreSQL |
 | 6379 | Redis |
 | 9090 | Prometheus |
 | 3000 | Grafana（`admin` / `admin`） |
+
+健康检查：`GET /health` 是存活探针（不做依赖 I/O，只报告本副本当前是否持有控制面
+Leader 租约）；`GET /health/ready` 会真连一次 PostgreSQL 并 `PING` Redis，任一不可用
+返回 `503 {"status": "degraded", "checks": {...}}`，Compose 的 healthcheck 用的就是它。
+每个响应都带 `X-Request-ID`（入站值合法则沿用，否则生成一个），同一个 id 会以
+`rid=…` 注入每一条应用日志，用户报错时可以直接对齐日志——日志里不会出现请求体与
+query string。
 
 API 不再自动写入演示密钥。签发租户（明文只打印一次）：
 
@@ -153,8 +162,9 @@ python -m app.cli create-tenant default
 Worker 只执行**已注册的 Handler**。任务按 `task_type` 经 `app/worker/registry.py`
 路由（`@vortex_registry.register("your.type")`）。`demo.echo`、`demo.noop`、
 `demo.sleep`、`demo.fail` 是内置示例 Handler（`app/worker/handlers.py`），供冒烟
-与压测复用。没有对应 Handler 的任务会抛 `UnregisteredTaskError`，由
-重试 / DLQ 管道接管，不会被静默吞掉。
+与压测复用；整组由 `ENABLE_DEMO_HANDLERS` 开关注册（本地开发与 CI 默认 `true`，
+生产建议 `false`，避免租户用 `demo.*` 占用 Worker 在途槽位）。没有对应 Handler
+的任务会抛 `UnregisteredTaskError`，由重试 / DLQ 管道接管，不会被静默吞掉。
 
 即时任务（把打印出的 Key 填进 `X-API-Key`）：
 
@@ -213,6 +223,32 @@ task_ids = client.submit_workflow(wf)  # -> ["<a-task-id>", "<b-task-id>"]
 异步调用方改用 `AsyncVortexMQClient`，同名方法 `await` 即可
 （`await client.submit_task(...)`、`await client.get_task_result(...)`、
 `await client.submit_workflow(...)`），并用 `async with` 管理连接。
+SDK 已是可安装包：`pip install -e sdk/python`。
+
+### AI Handler（`ai.deepseek.chat`）
+
+`ai.deepseek.chat` 真实调用 DeepSeek `chat/completions`。配置项：
+
+```bash
+DEEPSEEK_API_KEY=<your-key>          # 真实调用必需
+DEEPSEEK_TIMEOUT_SECONDS=120         # 单次调用超时
+AI_MAX_TOKENS_LIMIT=8192             # payload.max_tokens 上限
+AI_MOCK_ENABLED=false                # 生产默认
+```
+
+行为刻意保持显式：
+
+- **未配置 Key 且 `AI_MOCK_ENABLED=false`**：任务以 `AIProviderError` 失败，走
+  正常重试 / DLQ 管道。**绝不**回退成编造的文本——失败原因（含供应商 HTTP
+  状态码与响应片段）会写进 `error_msg`，在任务大厅里可直接看到。
+- **未配置 Key 且 `AI_MOCK_ENABLED=true`**：返回离线模拟文本，仅用于本地演示
+  与 CI（与 `ENABLE_DEMO_HANDLERS` 同性质的隔离：生产绝不能开着）。
+- 供应商错误（`401` 鉴权、`402` 余额、`429` 限流、`5xx`、超时、JSON 结构异常）
+  统一映射为带状态码的 `AIProviderError`。
+- `temperature` / `max_tokens` / `model` 在发请求前做边界校验。
+
+多节点上下文仍走 XCom：下游用 `{output}` 占位符渲染
+`_vortex_sys.upstream_results`。完整示例见 `examples/deepseek_novel_pipeline/`。
 
 管理面 API（任务大厅 / DLQ 重放 / 强制取消 / Worker 节点监控）使用独立的
 `X-Admin-Key`，不经过租户鉴权，需先在 `.env` 设置 `ADMIN_API_KEY`：
@@ -256,12 +292,16 @@ Worker 日志：`make logs-worker`。停止：`make down`。
 
 ```
 app/api/          HTTP，X-API-Key 租户鉴权
-app/core/         配置、异步引擎、Redis 连接池、Lua、Prometheus
+app/core/         配置、异步引擎、Redis 连接池、Lua、Prometheus、request id 日志
 app/models/       Tenant、TaskRecord
 app/services/     任务提交、Outbox Sweeper、Delay Dispatcher
 app/worker/       消费循环、Handler 注册表、退避、优雅停机
+console/          React + Vite 管理控制台（任务大厅、Worker 监控、DAG 视图）
+sdk/python/       可安装的客户端 SDK（同步 + 异步 + Fluent DAG 构建器）
+examples/         可直接运行的 DAG Showcase（DeepSeek 网文流水线）
 migrations/       Alembic 迁移脚本
 scripts/          asyncio + aiohttp 压测客户端
+tests/            基于真实 PostgreSQL / Redis 的集成测试
 ```
 
 API 进程：HTTP + Sweeper + Dispatcher。Worker 进程：`python -m app.worker`。数据面要单独扩容时，不要和 API 绑在同一个进程里。
@@ -295,3 +335,11 @@ API 进程：HTTP + Sweeper + Dispatcher。Worker 进程：`python -m app.worker
   `localStorage`（建议 HTTPS + CSP，或改为 httpOnly Cookie 会话）。
 - **状态枚举**：`FAILED` 目前没有写入方（失败一律走 PENDING 重试或 DLQ），保留
   仅为兼容历史行与查询面语义。
+- **AI Handler**：每次调用新建一个进程内 `httpx.AsyncClient`（不共享连接池），
+  除任务级指数退避外没有额外自动重试——供应商故障表现为重试 → DLQ，而不是
+  悄悄返回假输出。目前只接了 DeepSeek；新增供应商只需再注册一个 Handler
+  （`@vortex_registry.register`），不需要改 Worker。
+- **控制台**：以静态 Nginx 镜像发布，同源反向代理 `/api`（`console/nginx.conf`，
+  端口 8080）。Nginx 不做鉴权，`X-Admin-Key` 由 SPA 从 `localStorage` 读出后
+  附加，因此控制台应置于 TLS 之后，最好只在内网可达。
+

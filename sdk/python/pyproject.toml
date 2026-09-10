@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vortexmq-client"
+version = "0.1.0"
+description = "VortexMQ Python client SDK: sync + async HTTP clients with a fluent DAG builder"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.28"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vortexmq_client*"]

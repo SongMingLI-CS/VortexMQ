@@ -132,16 +132,29 @@ Schema evolution is versioned with **Alembic** (`migrations/`). On a fresh
 production database run `python -m alembic upgrade head`. If you already have a
 database created by the old scaffold-time `create_all`, run
 `python -m alembic stamp head` once and use migrations from then on. The app
-boot path keeps `create_all` only as a fallback for local scaffolding.
+boot path keeps `create_all` only as a fallback for local scaffolding — set
+`AUTO_CREATE_SCHEMA=false` in production (multi-replica) deployments so the boot
+path performs **no** DDL at all and schema changes are exclusively migration-driven.
 
 | Port | Service |
 |------|---------|
 | 8000 | API (`/docs`, `/metrics`) |
 | 8001 | Worker metrics |
+| 8080 | Admin console (`console/`, Nginx + same-origin `/api` proxy) |
 | 5432 | PostgreSQL |
 | 6379 | Redis |
 | 9090 | Prometheus |
 | 3000 | Grafana (`admin` / `admin`) |
+
+Health endpoints: `GET /health` is a liveness probe (no dependency I/O; it reports
+whether this replica currently holds the control-plane leader lease).
+`GET /health/ready` really opens a PostgreSQL connection and `PING`s Redis,
+returning `503 {"status": "degraded", "checks": {...}}` when either is down — that
+is what the Compose healthcheck uses. Every response also carries an
+`X-Request-ID` (an inbound value is reused when it looks sane, otherwise one is
+generated); the same id is injected into every application log line as `rid=…`,
+so a user-reported failure can be traced without logging request bodies or query
+strings.
 
 API keys are no longer seeded on boot. Issue a tenant key (plaintext is printed once):
 
@@ -152,9 +165,11 @@ python -m app.cli create-tenant default
 Workers execute **registered handlers only**. Tasks are routed by `task_type`
 through `app/worker/registry.py` (`@vortex_registry.register("your.type")`).
 `demo.echo`, `demo.noop`, `demo.sleep` and `demo.fail` are built-in sample
-handlers (`app/worker/handlers.py`) for smoke tests and load runs. A task whose
-type has no handler raises `UnregisteredTaskError` and is taken over by the
-retry / DLQ pipeline, so nothing is silently swallowed.
+handlers (`app/worker/handlers.py`) for smoke tests and load runs. The whole demo
+group is gated by `ENABLE_DEMO_HANDLERS` (default `true` for local dev and CI;
+set `false` in production so no tenant can burn worker slots with `demo.*`). A
+task whose type has no handler raises `UnregisteredTaskError` and is taken over
+by the retry / DLQ pipeline, so nothing is silently swallowed.
 
 Immediate task (put the printed key into `X-API-Key`):
 
@@ -212,7 +227,36 @@ task_ids = client.submit_workflow(wf)  # -> ["<a-task-id>", "<b-task-id>"]
 
 Async callers use `AsyncVortexMQClient` with the same methods awaited
 (`await client.submit_task(...)`, `await client.get_task_result(...)`,
-`await client.submit_workflow(...)`) and `async with`.
+`await client.submit_workflow(...)`) and `async with`. The SDK is a regular
+installable package: `pip install -e sdk/python`.
+
+### AI handler (`ai.deepseek.chat`)
+
+`ai.deepseek.chat` calls DeepSeek `chat/completions` for real. Configure it with:
+
+```bash
+DEEPSEEK_API_KEY=<your-key>          # required for real calls
+DEEPSEEK_TIMEOUT_SECONDS=120         # per-call timeout
+AI_MAX_TOKENS_LIMIT=8192             # upper bound for payload.max_tokens
+AI_MOCK_ENABLED=false                # production default
+```
+
+Behaviour is deliberately explicit:
+
+- **No key + `AI_MOCK_ENABLED=false`** → the task fails with `AIProviderError`
+  and goes through the normal retry / DLQ pipeline. There is **no** silent
+  fallback to fabricated text — the failure reason (including the provider HTTP
+  status and a response snippet) lands in `error_msg`, visible in the task hall.
+- **No key + `AI_MOCK_ENABLED=true`** → offline mock output, for local demos and
+  CI only (`ENABLE_DEMO_HANDLERS` style isolation: never leave it on in prod).
+- Provider errors (`401` auth, `402` quota, `429` rate limit, `5xx`, timeouts,
+  malformed JSON) are all mapped to `AIProviderError` with the status code.
+- `temperature` / `max_tokens` / `model` are validated and bounded before the
+  request is sent.
+
+Multi-node context still flows through XCom: a downstream node renders
+`{output}` from `_vortex_sys.upstream_results`. See
+`examples/deepseek_novel_pipeline/`.
 
 The Admin API (task hall / DLQ replay / force cancel / worker monitoring) uses a
 separate `X-Admin-Key` header instead of tenant auth. Set `ADMIN_API_KEY` in your
@@ -257,12 +301,16 @@ Worker logs: `make logs-worker`. Stop: `make down`.
 
 ```
 app/api/          HTTP, tenant auth via X-API-Key
-app/core/         config, async engine, Redis pool, Lua, Prometheus
+app/core/         config, async engine, Redis pool, Lua, Prometheus, request-id logging
 app/models/       Tenant, TaskRecord
 app/services/     submit, Outbox Sweeper, Delay Dispatcher
 app/worker/       consumer loop, handler registry, backoff, graceful stop
+console/          React + Vite admin console (task hall, workers, DAG view)
+sdk/python/       installable client SDK (sync + async + fluent DAG builder)
+examples/         runnable DAG showcase (DeepSeek novel pipeline)
 migrations/       Alembic schema migrations
 scripts/          asyncio + aiohttp stress client
+tests/            integration tests against real PostgreSQL and Redis
 ```
 
 API process: HTTP + Sweeper + Dispatcher. Worker process: `python -m app.worker`. Do not colocate them if you want the data plane to scale on its own.
@@ -302,3 +350,13 @@ Deliberate ceilings are marked with `ponytail:` comments in the code:
   session).
 - **Status enum**: `FAILED` currently has no writer (failures go to PENDING retry
   or DLQ) and is kept for backward compatibility with historical rows.
+- **AI handler**: one in-process `httpx.AsyncClient` per call (no shared pool) and
+  no automatic retry beyond the task-level exponential backoff — a provider
+  outage surfaces as retry → DLQ, not as silent fake output. Only DeepSeek is
+  wired up today; adding a provider means registering another handler
+  (`@vortex_registry.register`), not editing the worker.
+- **Console**: ships as a static Nginx image with a same-origin `/api` proxy
+  (`console/nginx.conf`, port 8080). Nginx does not authenticate requests — the
+  `X-Admin-Key` header is attached by the SPA from `localStorage`, so put the
+  console behind TLS and, ideally, an internal network.
+

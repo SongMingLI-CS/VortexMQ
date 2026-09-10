@@ -11,8 +11,13 @@
     python examples/deepseek_novel_pipeline/main.py --api-key <your-api-key>
     # 可选: --base-url http://127.0.0.1:8000
 
-未配置 ``DEEPSEEK_API_KEY`` 时，Worker 自动走 Mock 路径（sleep 1s 返回模拟
-文本），无需真实 LLM 也能完整跑通。
+模型调用方式二选一：
+
+- 配置 ``DEEPSEEK_API_KEY`` → 真实调用 DeepSeek ``chat/completions``；
+- 设置 ``AI_MOCK_ENABLED=true`` → 离线返回模拟文本，无需真实 LLM 也能完整跑通。
+
+两者都没有时 ``ai.deepseek.chat`` 会显式失败（``AIProviderError``）并进入
+重试 / DLQ 管道，不会把假文本当作模型输出。
 """
 
 from __future__ import annotations

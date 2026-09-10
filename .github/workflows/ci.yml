@@ -46,9 +46,35 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Byte-compile every tracked Python package
+        run: python -m compileall -q app tests sdk examples scripts
+
       - name: Verify Alembic migrations apply on an empty database
         run: python -m alembic upgrade head
 
       # 禁止 xdist 并发：多个测试进程会互相删 Redis 键、抢同一测试库 schema。
       - name: Run tests (serial)
         run: pytest -q -p no:xdist
+
+  console:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` 先跑 tsc（tsconfig strict），再 vite build：
+      # 类型错误会直接让流水线红掉，防止前端静默漂移。
+      - name: Typecheck and build console
+        run: npm run build
+
