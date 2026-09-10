@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { api, ApiError, setAdminKey } from '../api/client'
+import { api, ApiError, clearAdminKey, setAdminKey } from '../api/client'
 
 export function AdminKeyGate({ onAuthed }: { onAuthed: () => void }) {
   const [key, setKey] = useState('')
@@ -8,15 +8,18 @@ export function AdminKeyGate({ onAuthed }: { onAuthed: () => void }) {
 
   async function submit(e: FormEvent) {
     e.preventDefault()
-    if (!key.trim()) return
+    const candidate = key.trim()
+    if (!candidate) return
     setLoading(true)
     setError(null)
-    setAdminKey(key.trim())
+    // 先用候选 Key 打一次真实请求校验（错误 Key → 401，未启用 → 503）；
+    // 校验失败立即清掉，绝不让浏览器里留下一个「看起来已登录」的错误凭证。
+    setAdminKey(candidate)
     try {
-      // 用一次真实请求校验 Key（错误 Key → 401，未启用 → 503）
       await api.listWorkers()
       onAuthed()
     } catch (err) {
+      clearAdminKey()
       setError(err instanceof ApiError ? err.message : String(err))
     } finally {
       setLoading(false)

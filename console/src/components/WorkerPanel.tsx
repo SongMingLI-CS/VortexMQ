@@ -65,6 +65,9 @@ export function WorkerPanel() {
       {workers && workers.length === 0 && (
         <div className="empty">暂无存活 Worker。</div>
       )}
+      {loading && workers === null && (
+        <div className="panel__loading">加载中…</div>
+      )}
     </div>
   )
 }

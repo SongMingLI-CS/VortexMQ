@@ -119,13 +119,17 @@ export function DagView({
 }) {
   const [detail, setDetail] = useState<WorkflowDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
+    setLoading(true)
     setError(null)
     try {
       setDetail(await api.getWorkflow(workflowId))
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err))
+    } finally {
+      setLoading(false)
     }
   }, [workflowId])
 
@@ -149,6 +153,7 @@ export function DagView({
           </button>
         </div>
         {error && <div className="banner banner--error">{error}</div>}
+        {loading && <div className="panel__loading">加载中…</div>}
         <div className="dag">
           <ReactFlow
             nodes={flowNodes}

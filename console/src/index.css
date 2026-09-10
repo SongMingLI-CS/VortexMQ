@@ -136,6 +136,16 @@ body {
   gap: 6px;
 }
 
+/* 失败原因列：截断展示，完整内容在 title 里；避免长堆栈把表格撑爆 */
+.table td.cell-error {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, monospace;
+  font-size: 12px;
+}
+
 /* 按钮 */
 .btn {
   background: var(--accent);

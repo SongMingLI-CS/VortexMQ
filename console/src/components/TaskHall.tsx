@@ -22,6 +22,13 @@ function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 12)}…` : id
 }
 
+/** 失败原因只展示首行（堆栈首行通常是异常类型 + 消息），完整内容放在 title 里。 */
+function shortError(msg: string | null): string {
+  if (!msg) return '-'
+  const firstLine = msg.trim().split('\n')[0]
+  return firstLine.length > 48 ? `${firstLine.slice(0, 48)}…` : firstLine
+}
+
 export function TaskHall() {
   const [status, setStatus] = useState<string>('')
   // history[i] = 第 i+2 页实际使用的翻页游标；当前页 = history.length + 1
@@ -138,6 +145,7 @@ export function TaskHall() {
             <th>优先级</th>
             <th>重试</th>
             <th>创建时间</th>
+            <th>错误</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -153,6 +161,9 @@ export function TaskHall() {
               <td>{t.priority}</td>
               <td>{t.retry_count}</td>
               <td>{fmt(t.created_at)}</td>
+              <td className="cell-error" title={t.error_msg ?? ''}>
+                {shortError(t.error_msg)}
+              </td>
               <td className="actions">
                 {t.workflow_id && (
                   <button

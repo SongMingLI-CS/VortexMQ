@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { clearAdminKey, hasAdminKey } from './api/client'
+import { useEffect, useState } from 'react'
+import { clearAdminKey, hasAdminKey, setUnauthorizedHandler } from './api/client'
 import { AdminKeyGate } from './components/AdminKeyGate'
 import { TaskHall } from './components/TaskHall'
 import { WorkerPanel } from './components/WorkerPanel'
@@ -9,6 +9,12 @@ type Tab = 'tasks' | 'workers'
 export default function App() {
   const [authed, setAuthed] = useState(hasAdminKey())
   const [tab, setTab] = useState<Tab>('tasks')
+
+  useEffect(() => {
+    // Key 失效（轮换 / 后端换 Key）时自动退回登录门，不留在假的已登录状态
+    setUnauthorizedHandler(() => setAuthed(false))
+    return () => setUnauthorizedHandler(null)
+  }, [])
 
   if (!authed) {
     return <AdminKeyGate onAuthed={() => setAuthed(true)} />

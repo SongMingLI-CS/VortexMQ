@@ -32,6 +32,15 @@ export function hasAdminKey(): boolean {
   return getAdminKey().length > 0
 }
 
+type UnauthorizedHandler = () => void
+
+let unauthorizedHandler: UnauthorizedHandler | null = null
+
+/** 注册 401 回调：管理面 Key 失效（被轮换 / 后端换了 Key）时把用户送回登录门。 */
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -42,6 +51,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!res.ok) {
+    if (res.status === 401) {
+      // 清掉失效凭证并通知 UI 退回登录门；否则控制台会一直显示 401
+      // 却仍停在「已登录」的假状态。
+      clearAdminKey()
+      unauthorizedHandler?.()
+    }
     let detail = `HTTP ${res.status}`
     try {
       const body = await res.json()
