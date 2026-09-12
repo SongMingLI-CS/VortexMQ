@@ -1,0 +1,81 @@
+# ============================================================
+# VortexMQ · 云服务器部署叠加层
+#
+# 用法（仓库根目录）：
+#   docker compose --env-file .env -f docker-compose.yml -f deploy/docker-compose.deploy.yml up -d --build
+# 或经部署脚本： bash deploy/remote-deploy.sh
+#
+# 作用：
+# 1) 端口重映射 —— 与同机已部署项目（智汇于庄 / LMS）隔离：
+#      postgres   5432 -> 127.0.0.1:15432   （不对外暴露）
+#      redis      6379 -> 127.0.0.1:16379   （6379 已被智汇于庄占用）
+#      api        8000 -> 8000              （保持公网：/docs、/metrics）
+#      worker     8001 -> 127.0.0.1:18001   （Worker 指标，仅本机）
+#      console      80 -> 8081              （8080 已被 LMS 占用）
+#      prometheus 9090 -> 127.0.0.1:19090   （仅本机）
+#      grafana    3000 -> 127.0.0.1:13000   （仅本机）
+# 2) 口令改为 .env 注入（原 docker-compose.yml 硬编码 postgres/postgres、admin/admin）
+# 3) 构建改走国内镜像源，Dockerfile 换为 deploy/dockerfiles/*（应用源码零改动）
+#
+# 注意：Compose 合并多文件时 ports/expose 等「多值字段」是【拼接】而非替换，
+#       因此这里必须用 `!override`（Compose 2.24+，本机与服务器均 >= 2.40）强制替换，
+#       否则原始的 6379/8080/3000 仍会被绑定并直接冲突。
+# ============================================================
+
+services:
+
+  postgres:
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${VORTEXMQ_PG_PASSWORD:?VORTEXMQ_PG_PASSWORD 必须在 .env 中设置}
+    ports: !override
+      - "127.0.0.1:15432:5432"
+
+  redis:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:16379:6379"
+
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: deploy/dockerfiles/vortexmq.Dockerfile
+    environment:
+      # 覆盖 x-app-env 里的 postgres:postgres@... ，改用 .env 注入的强口令
+      DATABASE_URL: postgresql+asyncpg://postgres:${VORTEXMQ_PG_PASSWORD}@postgres:5432/vortexmq
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY 必须在 .env 中设置（缺失时 /api/v1/admin/** 返回 503）}
+    ports: !override
+      - "${API_PORT:-8000}:8000"
+
+  worker:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: deploy/dockerfiles/vortexmq.Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${VORTEXMQ_PG_PASSWORD}@postgres:5432/vortexmq
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY 必须在 .env 中设置}
+    ports: !override
+      - "127.0.0.1:18001:8001"
+
+  console:
+    restart: unless-stopped
+    build:
+      context: ./console
+      # 相对 context 解析：console/../deploy/dockerfiles/console.Dockerfile
+      dockerfile: ../deploy/dockerfiles/console.Dockerfile
+    ports: !override
+      - "${CONSOLE_PORT:-8081}:80"
+
+  prometheus:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:19090:9090"
+
+  grafana:
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD 必须在 .env 中设置}
+    ports: !override
+      - "127.0.0.1:13000:3000"
